@@ -1,0 +1,85 @@
+# /etc/default/moodle-health — settings for /usr/local/sbin/moodle-health (no secrets here; mode 644 is fine).
+# The healthchecks.io ping URL is NOT in this file: it lives in /etc/default/moodle-health.url (root, mode 600),
+# written by the owner with a no-echo command. Never put the URL, a password or a token in this file.
+#
+# Template of the moodle-server-care "monitoring" module. scripts/install.sh fills the <...> values from
+# ~/.config/moodle-server-care/server.env and read-only discovery; review every line before installing.
+# Format: KEY=VALUE, one per line; quote values with spaces; trailing "# comment" allowed. A key left out (or
+# empty) disables the check that needs it; `moodle-health --self-check` shows what is active and why.
+
+# --- the site --------------------------------------------------------------------------------------------------
+# Moodle's $CFG->wwwroot (scheme, host, port and sub-path are taken from it). SITE is only a fallback.
+WWWROOT=<WWWROOT>
+SITE=<SITE>
+# Moodle code root (the directory with config.php; admin/cli/checks.php is found from here, 4.x and 5.x).
+MOODLE=<MOODLE>
+DATAROOT=<DATAROOT>
+# PHP CLI of the site's FPM pool (php8.3, php8.4 ...) and the web user Moodle runs as. Moodle's status checks run
+# as this user (setpriv), never as root: root would leave root-owned cache files in the dataroot.
+PHPBIN=<PHP>
+WEBUSER=<WEBUSER>
+# Where the web server answers on this machine. 127.0.0.1 unless it listens only on a public/private IP or ::1.
+PROBE_ADDR=127.0.0.1
+# Page probed every minute and the text that proves the Moodle login form rendered (every Moodle login form has a
+# hidden "logintoken" field). Change LOGIN_PATH only for SSO sites that redirect the login page (see checks.md).
+LOGIN_PATH=/login/index.php
+LOGIN_MARKER='name="logintoken"'
+
+# --- services that must be active (systemd unit names, space separated) ------------------------------------------
+# Web server, every PHP-FPM version that serves an enabled site, database, cache, MTA, cron, fail2ban.
+SERVICES="<SERVICES>"
+
+# --- database and cache (liveness only; no credentials are used) --------------------------------------------------
+# DBTYPE from config.php: mariadb / mysqli / auroramysql (mysqladmin ping) or pgsql (pg_isready); others: skipped.
+DBTYPE=<DBTYPE>
+# Empty or localhost: local socket. A remote host name/IP is passed with -h.
+DBHOST=<DBHOST>
+# yes / no / auto (auto = check when redis-cli exists). NOAUTH counts as alive, so no Redis password is needed.
+REDIS_CHECK=<REDIS_CHECK>
+# Extra redis-cli arguments for a non-default server, e.g. "-s /run/redis/redis-server.sock" or "-h 10.0.0.5 -p 6380".
+REDIS_CLI_ARGS=""
+
+# --- logs --------------------------------------------------------------------------------------------------------
+# Access log(s) of the Moodle vhost, nginx or Apache "combined"-style ([time] "request" status ...). Space separated.
+ACCESS_LOG="<ACCESS_LOG>"
+# Only for a shared Apache log in vhost_combined format (other_vhosts_access.log): count lines of this vhost only.
+ACCESS_LOG_VHOST=""
+# PHP-FPM master logs (they record "server reached pm.max_children"). Space separated; empty with mod_php.
+FPM_LOGS="<FPM_LOGS>"
+# Apache error log (records "server reached MaxRequestWorkers"); empty on nginx servers.
+APACHE_ERROR_LOG=<APACHE_ERROR_LOG>
+# File the Moodle cron job writes every run (from the web user's crontab redirect). Empty if cron output is discarded.
+CRON_LOG=<CRON_LOG>
+
+# --- mail, proxy, other sites ------------------------------------------------------------------------------------
+# exim (exiqgrep), postfix (postqueue -j, else mailq), none, or auto (exim if exiqgrep exists, else Postfix).
+MTA=<MTA>
+# File with the CDN/proxy ranges (nginx set_real_ip_from, Apache RemoteIPTrustedProxy, or a plain CIDR list).
+# Enables the "fail2ban banned a Cloudflare/proxy address" check. Empty when the site is not behind a proxy.
+CF_RANGES_FILE=<CF_RANGES_FILE>
+# Other vhosts on this machine, probed by SNI on a static path: "host" (uses /favicon.ico) or "host/path".
+# Only a dead vhost (no answer or 5xx) alerts. Decide the list with the owner; leave empty if none.
+EXTRA_SITES="<EXTRA_SITES>"
+# Filesystems to watch (deduplicated by device). Empty = / , DATAROOT, /var/lib/mysql, /var/lib/postgresql, /var/log.
+DISK_PATHS=""
+
+# --- Moodle status checks (admin/cli/checks.php --type=status, every MOODLE_CHECKS_EVERY_MIN minutes) ------------
+# Alerts only for ERROR/CRITICAL checks not in the baseline (moodle-health --baseline) or whose message changed.
+# Refs listed here never alert (a known, accepted problem); refs in MOODLE_WARN_AS_CRIT alert on WARNING too.
+MOODLE_CHECKS_IGNORE=""
+MOODLE_WARN_AS_CRIT=""
+
+# --- thresholds (defaults from the first server; tune after a week of --status / healthchecks history) ----------
+WINDOW_MIN=5             # minutes of access/FPM log looked at
+ERR5XX_MIN=20            # at least this many 5xx ...
+ERR5XX_PCT=5             # ... and at least this % of requests in the window
+SLOW_SEC=5               # login page slower than this: warning only
+DISK_CRIT_PCT=90         # disk or inode use
+MEM_CRIT_PCT=5           # MemAvailable below this % of RAM
+MAIL_STUCK_CRIT=10       # this many real messages older than MAIL_STUCK_MIN: critical (fewer: warning)
+MAIL_STUCK_MIN=15
+CERT_CRIT_DAYS=14        # origin certificate expiry
+CRON_STALE_MIN=10        # cron log not written for this long
+MOODLE_CHECKS_EVERY_MIN=15
+CONFIRM_OF=3             # a critical problem alerts when seen in CONFIRM_NEED of the last CONFIRM_OF runs
+CONFIRM_NEED=2

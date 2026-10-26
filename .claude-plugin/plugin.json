@@ -1,0 +1,18 @@
+{
+  "name": "moodle-server-care",
+  "version": "0.1.0",
+  "description": "Safe, step-by-step care of production Moodle servers: read-only audit and team report, monitoring with Telegram alerts, Cloudflare onboarding, background mail, nginx hardening, Moodle tuning, hygiene, encrypted backups and maintenance nights. Each module runs on its own; every change follows backup, test, verify, rollback and an operations log.",
+  "author": {
+    "name": "Wail Abualela"
+  },
+  "keywords": [
+    "moodle",
+    "production",
+    "nginx",
+    "cloudflare",
+    "exim",
+    "backup",
+    "operations",
+    "monitoring"
+  ]
+}

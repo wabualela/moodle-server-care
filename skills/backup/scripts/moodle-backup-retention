@@ -1,0 +1,179 @@
+#!/bin/bash
+set +x
+# moodle-backup-retention: enforce (--apply) or check (--check) the keep-N policy (default 7 daily / 4 weekly /
+# 6 monthly / 4 code) on the crypt remote of moodle-backup. Part of moodle-server-care (skills/backup).
+#
+# Installed as /usr/local/sbin/<NAME>-retention (root:root 0700) next to /usr/local/sbin/<NAME>; reads
+# /etc/default/<NAME>. Called by <NAME> at the end of each night run; can also be run by hand.
+#
+#   --apply              delete what falls outside the policy (SharePoint: no lifecycle rules exist there)
+#   --check              report only (what --apply would delete, incomplete sets, stale or missing backups)
+#   --check --lifecycle  S3/R2 with lifecycle + lock rules on the bucket: also flag sets that outlived the rule that
+#                        should have removed them (a lifecycle rule that does not match its prefix)
+#
+# Rule per folder: a SET is all objects with the same run stamp YYYYMMDD-HHMM. Only COMPLETE sets (db + config +
+# manifest; the manifest is uploaded last) count toward KEEP. The newest KEEP complete sets are never deleted; an older
+# set (complete or not) is deleted only when it is at least MIN_AGE days old. A stalled backup therefore never makes
+# this script delete the last KEEP good sets, and a run of failed uploads cannot push good sets out.
+# MIN_AGE must stay ABOVE any bucket lock period on that prefix (R2: lock = MIN_AGE - 1 day), or --apply hits locks.
+#
+#   folder            keep  min age (days)
+#   daily/              7        8
+#   weekly/             4       29
+#   monthly/            6      186
+#   code/               4       29        (one file per set: always complete)
+#   filedir-deleted/    -      186        (one folder per night that removed files; = the oldest monthly set)
+#                                         and never while a kept complete set is older than the folder: a restore of
+#                                         that set needs every filedir-deleted/<run> with run >= its stamp
+set -Eeuo pipefail
+umask 077
+export LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root
+
+NAME=$(basename -- "$0"); NAME=${NAME%-retention}
+[[ $NAME =~ ^[a-z0-9][a-z0-9-]{1,40}$ ]] || NAME=moodle-backup
+BACKEND=""
+REMOTE="${NAME}-crypt:"
+RCLONE_CONF=/var/lib/$NAME/rclone/rclone.conf
+SET_PREFIX=moodle
+KEEP_DAILY=7;   AGE_DAILY=8
+KEEP_WEEKLY=4;  AGE_WEEKLY=29
+KEEP_MONTHLY=6; AGE_MONTHLY=186
+KEEP_CODE=4;    AGE_CODE=29
+AGE_DELETED=186
+STALE_HOURS=30            # newest complete daily set older than this = backups stopped
+LIFECYCLE_GRACE_DAYS=2    # --lifecycle: a set older than MIN_AGE + this means the bucket rule is not working
+TPSLIMIT=""
+USER_AGENT=""
+UA_ORG="MoodleServerCare"
+DEFAULTS=/etc/default/$NAME
+if [ -r "$DEFAULTS" ]; then . "$DEFAULTS"; fi
+case "$BACKEND" in onedrive) : "${TPSLIMIT:=8}" ;; *) : "${TPSLIMIT:=0}" ;; esac
+: "${USER_AGENT:=NONISV|$UA_ORG|moodle-backup/msc-backup-1.1}"
+[[ $SET_PREFIX =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo "SET_PREFIX '$SET_PREFIX' is unusual" >&2; exit 2; }
+
+MODE=--apply; LIFECYCLE=0
+for a in "$@"; do
+  case "$a" in
+    --apply) MODE=--apply ;;
+    --check) MODE=--check ;;
+    --lifecycle) LIFECYCLE=1 ;;
+    *) echo "usage: $(basename -- "$0") [--apply | --check [--lifecycle]]" >&2; exit 2 ;;
+  esac
+done
+[ "$LIFECYCLE" = 0 ] || [ "$MODE" = --check ] || { echo "--lifecycle goes with --check only" >&2; exit 2; }
+case "$BACKEND" in onedrive) WHERE="to the SharePoint recycle bin" ;; *) WHERE="removed from the bucket" ;; esac
+
+now=$(date +%s)
+problems=0
+OLDEST_KEPT=""   # oldest complete daily/weekly/monthly set that stays; filedir-deleted/ folders from then on are needed
+LIST_FAILED=0    # a set folder could not be listed: which sets stay is unknown, so filedir-deleted/ is not pruned
+keep_stamp() { if [ -z "$OLDEST_KEPT" ] || [[ $1 < $OLDEST_KEPT ]]; then OLDEST_KEPT=$1; fi; }
+r() { rclone --config "$RCLONE_CONF" --user-agent "$USER_AGENT" --tpslimit "$TPSLIMIT" "$@"; }
+stamp_epoch() { date -d "${1:0:8} ${1:9:2}:${1:11:2}" +%s; }   # YYYYMMDD-HHMM -> epoch (local time)
+
+# list_or_flag <var> <rclone lsf args...>: lsf into <var>; "directory not found" (exit 3) = empty; any other error is a
+# problem (never treated as "empty", which could look like a reason to make or delete copies).
+list_or_flag() {
+  local -n _out=$1; shift
+  local rc=0
+  _out=$(r lsf "$@" 2>&1) || rc=$?
+  if [ "$rc" = 3 ]; then _out=""; return 0; fi
+  if [ "$rc" != 0 ]; then echo "  ERROR listing ($*): rclone exit $rc: ${_out:0:300}"; _out=""; problems=$((problems + 1)); return 1; fi
+}
+
+prune_sets() {  # prune_sets <folder> <keep> <min_age_days>
+  local folder=$1 keep=$2 minage=$3 n=0 ts age kinds listing newest_ok="" complete
+  local -A have=()
+  local -a stamps=()
+  list_or_flag listing --files-only "${REMOTE}${folder}/" || { LIST_FAILED=1; return 0; }
+  while read -r kind ts; do
+    [ -n "$ts" ] || continue
+    have[$ts]+=" $kind"
+  done < <(sed -nE "s/^$SET_PREFIX-([a-z]+)-([0-9]{8}-[0-9]{4})\..*\$/\1 \2/p" <<<"$listing")
+  if [ "${#have[@]}" -gt 0 ]; then mapfile -t stamps < <(printf '%s\n' "${!have[@]}" | sort -r); fi
+  for ts in "${stamps[@]}"; do
+    kinds=${have[$ts]}
+    complete=0
+    if [ "$folder" = code ] || [[ $kinds == *" db"* && $kinds == *" config"* && $kinds == *" manifest"* ]]; then
+      complete=1
+      n=$((n + 1))
+      [ -n "$newest_ok" ] || newest_ok=$ts
+      if [ "$n" -le "$keep" ]; then [ "$folder" = code ] || keep_stamp "$ts"; continue; fi
+    else
+      # A failed upload leaves an incomplete set; the failed run already alerted. Never counted toward KEEP.
+      echo "  $folder $ts: incomplete set (has:$kinds), not counted"
+    fi
+    age=$(( (now - $(stamp_epoch "$ts")) / 86400 ))
+    if [ "$age" -lt "$minage" ]; then
+      echo "  $folder $ts: outside the newest $keep but only ${age}d old (< ${minage}d), kept"
+      if [ "$complete" = 1 ] && [ "$folder" != code ]; then keep_stamp "$ts"; fi
+      continue
+    fi
+    if [ "$MODE" = --apply ]; then
+      if r delete "${REMOTE}${folder}/" --include "$SET_PREFIX-*-${ts}.*"; then
+        echo "  $folder $ts: deleted (age ${age}d; $WHERE)"
+      else
+        echo "  ERROR $folder $ts: delete failed (bucket lock longer than ${minage}d?)"; problems=$((problems + 1))
+        if [ "$complete" = 1 ] && [ "$folder" != code ]; then keep_stamp "$ts"; fi
+      fi
+    elif [ "$LIFECYCLE" = 1 ] && [ "$age" -gt $(( minage + LIFECYCLE_GRACE_DAYS )) ]; then
+      echo "  WARN $folder $ts: ${age}d old, the bucket lifecycle rule (${minage}d) should have removed it"; problems=$((problems + 1))
+      if [ "$complete" = 1 ] && [ "$folder" != code ]; then keep_stamp "$ts"; fi   # it is still there
+    else
+      echo "  $folder $ts: would be deleted (age ${age}d)"
+    fi
+  done
+  echo "$folder: ${#stamps[@]} set(s), $n complete, policy keeps $keep"
+  if [ "$n" -eq 0 ]; then
+    echo "  WARN: no complete set in $folder/"; problems=$((problems + 1))
+  elif [ "$folder" = daily ]; then
+    local newest_h=$(( (now - $(stamp_epoch "$newest_ok")) / 3600 ))
+    if [ "$newest_h" -gt "$STALE_HOURS" ]; then
+      echo "  WARN: newest complete daily set $newest_ok is ${newest_h} h old"; problems=$((problems + 1))
+    fi
+  fi
+}
+
+prune_deleted() {  # one folder per run under filedir-deleted/, named by run stamp
+  local d ts age kept=0 needed=0 gone=0 listing
+  if [ "$LIST_FAILED" = 1 ]; then
+    echo "filedir-deleted: not pruned tonight (a set folder could not be listed, so which sets still need it is unknown)"
+    return 0
+  fi
+  list_or_flag listing --dirs-only "${REMOTE}filedir-deleted/" || return 0
+  while read -r d; do
+    [ -n "$d" ] || continue
+    ts=${d%/}
+    [[ $ts =~ ^[0-9]{8}-[0-9]{4}$ ]] || { echo "  filedir-deleted/$d: unexpected name, ignored"; continue; }
+    age=$(( (now - $(stamp_epoch "$ts")) / 86400 ))
+    if [ "$age" -lt "$AGE_DELETED" ]; then kept=$((kept + 1)); continue; fi
+    if [ -n "$OLDEST_KEPT" ] && ! [[ $ts < $OLDEST_KEPT ]]; then
+      needed=$((needed + 1)); echo "  filedir-deleted/$ts: ${age}d old but kept (needed to restore the kept set $OLDEST_KEPT)"; continue
+    fi
+    if [ "$MODE" = --apply ]; then
+      # purge = one DELETE of the folder on OneDrive; fall back to file deletes + rmdirs if the service refuses it
+      if r purge "${REMOTE}filedir-deleted/$ts" || { r delete "${REMOTE}filedir-deleted/$ts" && r rmdirs "${REMOTE}filedir-deleted/$ts"; }; then
+        gone=$((gone + 1)); echo "  filedir-deleted/$ts: removed (age ${age}d)"
+      else
+        echo "  ERROR filedir-deleted/$ts: removal failed"; problems=$((problems + 1))
+      fi
+    elif [ "$LIFECYCLE" = 1 ] && [ "$age" -gt $(( AGE_DELETED + LIFECYCLE_GRACE_DAYS )) ]; then
+      echo "  WARN filedir-deleted/$ts: ${age}d old, the lifecycle rule should have removed it"; problems=$((problems + 1))
+    else
+      echo "  filedir-deleted/$ts: would be removed (age ${age}d)"
+    fi
+  done <<<"$listing"
+  echo "filedir-deleted: $kept folder(s) younger than ${AGE_DELETED} days, $needed older but still needed, $gone removed"
+}
+
+echo "retention $MODE$([ "$LIFECYCLE" = 1 ] && echo ' --lifecycle') ($(date '+%F %T'))"
+prune_sets daily   "$KEEP_DAILY"   "$AGE_DAILY"
+prune_sets weekly  "$KEEP_WEEKLY"  "$AGE_WEEKLY"
+prune_sets monthly "$KEEP_MONTHLY" "$AGE_MONTHLY"
+prune_sets code    "$KEEP_CODE"    "$AGE_CODE"
+prune_deleted
+if [ "$problems" -gt 0 ]; then
+  echo "retention: $problems problem(s)"
+  exit 3
+fi
+echo "retention: ok"

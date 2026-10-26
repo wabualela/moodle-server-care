@@ -1,0 +1,13 @@
+        # nginx module, step 3: rate limits - DRY RUN first (nothing is rejected; would-be hits are logged).
+        # Enforce later by removing the two *_dry_run lines (step 4). Zones: assets/moodle-ratelimit.conf.
+        limit_req  zone=moodle_front    burst=30 nodelay;   # front page /index.php: 60 r/m per client + 30 burst
+        limit_req  zone=moodle_fallback burst=20 nodelay;   # unknown URLs routed to r.php (Moodle 4.5+ only)
+        limit_conn moodle_front_conn 6;                     # concurrent front-page requests per client
+        # Deferred until >= 7 days of data incl. a weekend peak (step 5). Dry run is per location, so these
+        # cannot stay in dry run once the lines above are enforced: they stay commented out until the replay is clean.
+        # limit_req  zone=moodle_php  burst=400 nodelay;
+        # limit_req  zone=moodle_auth burst=60  nodelay;
+        limit_req_dry_run  on;
+        limit_conn_dry_run on;
+        limit_req_status   429;    # not the default 503: distinguishable in logs and for users
+        limit_conn_status  429;

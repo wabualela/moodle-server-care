@@ -1,0 +1,12 @@
+# moodle-server-care / hygiene H3 — shape of the web user's crontab after the fix (install with: crontab -u <WEBUSER> FILE)
+# Every job writes its own output to a rotated log or /dev/null; MAILTO="" is the safety net for lines added later.
+MAILTO=""
+
+# Moodle scheduled tasks (Moodle 5.1+: the CLI stays in <MOODLE>/admin/cli, not under public/)
+* * * * * /usr/bin/<PHP> <MOODLE>/admin/cli/cron.php >> /var/log/moodle_cron/<site>_cron.log 2>&1
+
+# Optional dedicated ad hoc task runner (one line only; a duplicate line starts two runners per minute)
+* * * * * /usr/bin/<PHP> <MOODLE>/admin/cli/adhoc_task.php --execute --keep-alive=59 >> /var/log/moodle_cron/<site>_adhoc.log 2>&1
+
+# Other apps on the box (example: a Laravel scheduler with nothing worth keeping in its output)
+# * * * * * cd <APP_DIR> && <PHP for that app> artisan schedule:run >> /dev/null 2>&1

@@ -1,0 +1,10 @@
+# Origin lock for the Moodle site (cloudflare module, references/origin-exposure.md section 3).
+# Prerequisites: /etc/nginx/conf.d/cloudflare-realip.conf regenerated with `cf-ranges.sh --geo --origin-ip <ORIGIN_IP>`
+# (defines $from_cloudflare from $realip_remote_addr, the TCP peer), real-IP verified, site working through Cloudflare.
+#
+# Put this ONE line inside the Moodle `server { ... listen 443 ssl ...; }` block, near the top (before the locations).
+# Not in the port-80 server (redirects and certificate challenges stay reachable), not in other sites.
+    if ($from_cloudflare = 0) { return 444; }   # origin lock: Moodle only through Cloudflare and this server
+#
+# Rollback: delete the line, `sudo nginx -t && sudo systemctl reload nginx`.
+# BEFORE grey-clouding the DNS records (stopping Cloudflare), remove this line first, or every visitor is refused.

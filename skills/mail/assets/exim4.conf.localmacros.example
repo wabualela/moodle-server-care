@@ -1,0 +1,21 @@
+# /etc/exim4/exim4.conf.localmacros  (non-split config)
+# /etc/exim4/conf.d/main/000_localmacros  (split config: dc_use_split_config='true')
+#
+# Written by scripts/exim-smarthost-setup.sh; shown here so the result can be reviewed and rebuilt by hand.
+# Mode 644 root:root: it holds no secret (credentials live in /etc/exim4/passwd.client, 640 root:Debian-exim).
+#
+# Port 465 is SMTPS: TLS starts on connect, before any SMTP command. Without this macro exim would speak plain
+# SMTP to port 465 and the connection would hang until it timed out.
+REMOTE_SMTP_SMARTHOST_PROTOCOL = smtps
+#
+# Refuse to talk to the smarthost without TLS (with port 587 this forces STARTTLS; keep it and drop the line above).
+# Certificate verification is already on by default in the Debian template (REMOTE_SMTP_SMARTHOST_TLS_VERIFY_HOSTS = *).
+REMOTE_SMTP_SMARTHOST_HOSTS_REQUIRE_TLS = *
+#
+# Optional, only if the provider rejects the greeting (exim says EHLO <primary_hostname>, often a short host name):
+# REMOTE_SMTP_HELO_DATA = <SITE>
+#
+# Not a macro: "hosts_require_auth = *" is added to transport remote_smtp_smarthost in the template (or in
+# conf.d/transport/30_exim4-config_remote_smtp_smarthost), directly before ".ifdef REMOTE_SMTP_SMARTHOST_HOSTS_AVOID_TLS".
+# The stock transport only TRIES to authenticate; with that line a failed login defers (mail stays queued) instead of
+# being sent unauthenticated and bounced for good.

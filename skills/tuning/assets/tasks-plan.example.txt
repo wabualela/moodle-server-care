@@ -1,0 +1,29 @@
+# Example plan for tasks-apply.php (moodle-server-care, module "tuning").
+# Normally you do not write this by hand: tasks-review.php --plan-out=FILE writes a draft for THIS site, with every
+# proposal commented out as "#? ". Un-comment only the lines the owner approved. This example shows the format and
+# the set that worked on the first server (adapt the class list to what the review finds on each server).
+#
+# Actions (one per line, one line per task; "#" starts a comment):
+#   schedule CLASS MIN HOUR DAY MONTH DOW   crontab fields as in the admin form; "R" = random, expanded once
+#   reset CLASS                             back to the default schedule and default disabled flag
+#   disable CLASS                           only while the task's plugin is disabled; otherwise printed as KEEP
+#   disable-anyway CLASS                    disable although the plugin is enabled (stops a feature: name it to the owner)
+#   enable CLASS
+#   config NAME VALUE                       cron_keepalive | task_scheduled_concurrency_limit | task_adhoc_concurrency_limit
+
+# Heavy every-minute core task: once a day in the quiet hours (pick a minute away from :00/:15/:30/:45)
+schedule \core\task\question_preview_cleanup_task 17 1 * * *
+
+# Safety-net syncs (observers enrol immediately): every 15 minutes, or "reset" for the default (hourly)
+schedule \enrol_cohort\task\enrol_cohort_sync */15 * * * *
+schedule \enrol_meta\task\enrol_meta_sync */15 * * * *
+
+# Enabled tasks of plugins that are disabled on this site (cron locks and skips them on every poll)
+disable \enrol_paypal\task\process_expirations
+disable \mod_workshop\task\cron_task
+
+# Fewer overlapping cron runners (3-4 with the default 180 s)
+config cron_keepalive 120
+
+# Needs business sign-off (course completion aggregation up to 5 min later); the first server left it unchanged:
+#? schedule \core\task\completion_regular_task */5 * * * *

@@ -1,0 +1,37 @@
+# Postfix as a local, queueing relay client for Moodle (see references/postfix-relay.md).
+# Apply with `postconf -e 'key = value'` one line at a time after backing up main.cf, then `postfix check`,
+# `systemctl reload postfix`. Replace <SMARTHOST> with the provider's SMTP host. Nothing here is secret.
+
+# Listen on loopback only: Moodle connects to 127.0.0.1:25; nobody else may.
+inet_interfaces = loopback-only
+mynetworks = 127.0.0.0/8 [::1]/128
+
+# Keep local delivery for cron and system mail ($myhostname, localhost). Never list the site's mail domain here,
+# or mail to staff at that domain would be delivered locally.
+# mydestination = $myhostname, localhost.$mydomain, localhost
+
+# Relay everything else through the provider on port 465 (SMTPS, TLS from the first byte; Postfix >= 3.0).
+relayhost = [<SMARTHOST>]:465
+smtp_tls_wrappermode = yes
+# "secure" = encrypted AND the certificate must match the relay host name (like exim's tls_verify_hosts = *).
+smtp_tls_security_level = secure
+smtp_tls_CApath = /etc/ssl/certs
+
+# Port 587 instead (STARTTLS): relayhost = [<SMARTHOST>]:587, drop smtp_tls_wrappermode, keep security level secure.
+
+# Authentication (credentials file written by scripts/owner-add-credentials.sh --mta postfix; needs libsasl2-modules).
+smtp_sasl_auth_enable = yes
+smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd
+smtp_sasl_security_options = noanonymous
+smtp_sasl_tls_security_options = noanonymous
+# Default yes since Postfix 2.5: a rejected login (535) defers instead of bouncing. There is no exact equivalent of
+# exim's hosts_require_auth: if the map lookup finds nothing, Postfix sends WITHOUT auth. check-credentials.sh proves
+# the lookup returns a value before Moodle is switched.
+smtp_sasl_auth_soft_bounce = yes
+
+# Optional, only if the provider rejects a non-FQDN greeting:
+# smtp_helo_name = <SITE>
+
+# Optional safety net for the first 24-48 hours only: turns every permanent error into a temporary one, so nothing
+# bounces while you watch. Remove it afterwards (it also delays real bounces).
+# soft_bounce = yes

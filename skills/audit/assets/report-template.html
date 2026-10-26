@@ -1,0 +1,595 @@
+<title>{{REPORT_TITLE}}</title>
+<!-- moodle-server-care · audit module · Arabic team report template.
+     How to fill it: references/team-page.md. Every {{PLACEHOLDER}} is wrapped in <mark class="ph"> so it shows
+     highlighted in the preview; before publishing `grep -c '{{' file` must print 0 and DATA.example must be false.
+     Rows/cards marked <!-- repeat --> are examples: copy as needed, delete the rest. Optional sections are marked. -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one reading column, RTL, a compact sticky contents bar; tables and charts scroll inside their own boxes. */
+/* ===== VISUAL IDENTITY: the only block to edit per platform (references/team-page.md §4) =====
+   Source of these values: {{THEME_COLOUR_SOURCE e.g. theme setting names}}. Neutral defaults below. */
+:root {
+  --brand: #3d5a80;          /* primary brand colour (theme primary / brandcolor) */
+  --brand-strong: #2f4766;   /* hover / darker shade */
+  --brand-deep: #1b2430;     /* body text: near-black of the brand hue */
+  --brand-soft: #e9eef5;     /* light tint for boxes and pills */
+  --page: #f7f8fa;           /* page background: off-white with a hint of the hue */
+  --highlight: #e76f51;      /* accent: "ask" boxes, p95 line, header rule */
+  --highlight-text: #a8432a; /* accent dark enough for text on light backgrounds */
+  --font-brand: "IBM Plex Sans Arabic";
+}
+/* ===== end of the identity block ===== */
+:root {
+  --bg: var(--page);
+  --surface: #ffffff;
+  --fg: var(--brand-deep);
+  --muted: #5f6672;
+  --line: #e1e4ea;
+  --accent: var(--brand);
+  --accent-strong: var(--brand-strong);
+  --accent-soft: var(--brand-soft);
+  --on-accent: #ffffff;
+  --band: var(--brand);
+  --band-fg: #ffffff;
+  --band-muted: rgba(255, 255, 255, .78);
+  --warn: #9a5b0c;
+  --warn-soft: #fbefdc;
+  --crit: #b3261e;
+  --crit-soft: #fbe7e5;
+  --ok: #1f6b4f;
+  --ok-soft: #e1f2ea;
+  --bar-mobile: var(--brand);
+  --bar-desktop: color-mix(in srgb, var(--brand) 50%, #ffffff);
+  --bar-other: color-mix(in srgb, var(--brand) 18%, #ffffff);
+  --line-p95: var(--highlight);
+  --font-display: var(--font-brand), "Segoe UI", Tahoma, sans-serif;
+  --font-body: var(--font-brand), "Segoe UI", Tahoma, sans-serif;
+  --font-data: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+/* Dark mode: keep the hue, lighten the brand so text and lines keep contrast (4.5:1 text, 3:1 lines). */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #15181d; --surface: #1e2229; --fg: #eef1f5; --muted: #a9b0bb; --line: #333944;
+    --accent: color-mix(in srgb, var(--brand) 45%, #ffffff); --accent-strong: color-mix(in srgb, var(--brand) 30%, #ffffff);
+    --accent-soft: color-mix(in srgb, var(--brand) 35%, #15181d); --on-accent: #15181d;
+    --band: color-mix(in srgb, var(--brand) 70%, #000000); --band-fg: #ffffff; --band-muted: rgba(255, 255, 255, .75);
+    --highlight-text: color-mix(in srgb, var(--highlight) 70%, #ffffff);
+    --warn: #e8b766; --warn-soft: #3a2c19; --crit: #f19188; --crit-soft: #3c1f1e; --ok: #8fd4b4; --ok-soft: #1c3229;
+    --bar-mobile: color-mix(in srgb, var(--brand) 45%, #ffffff); --bar-desktop: color-mix(in srgb, var(--brand) 65%, #15181d);
+    --bar-other: color-mix(in srgb, var(--brand) 30%, #15181d); --line-p95: color-mix(in srgb, var(--highlight) 75%, #ffffff);
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #15181d; --surface: #1e2229; --fg: #eef1f5; --muted: #a9b0bb; --line: #333944;
+  --accent: color-mix(in srgb, var(--brand) 45%, #ffffff); --accent-strong: color-mix(in srgb, var(--brand) 30%, #ffffff);
+  --accent-soft: color-mix(in srgb, var(--brand) 35%, #15181d); --on-accent: #15181d;
+  --band: color-mix(in srgb, var(--brand) 70%, #000000); --band-fg: #ffffff; --band-muted: rgba(255, 255, 255, .75);
+  --highlight-text: color-mix(in srgb, var(--highlight) 70%, #ffffff);
+  --warn: #e8b766; --warn-soft: #3a2c19; --crit: #f19188; --crit-soft: #3c1f1e; --ok: #8fd4b4; --ok-soft: #1c3229;
+  --bar-mobile: color-mix(in srgb, var(--brand) 45%, #ffffff); --bar-desktop: color-mix(in srgb, var(--brand) 65%, #15181d);
+  --bar-other: color-mix(in srgb, var(--brand) 30%, #15181d); --line-p95: color-mix(in srgb, var(--highlight) 75%, #ffffff);
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--font-body); font-size: 16px; line-height: 1.8; }
+.page { max-width: 920px; margin: 0 auto; padding-inline: 16px; padding-block: 28px 64px; display: grid; gap: 40px; }
+h1, h2, h3 { font-family: var(--font-display); font-weight: 600; line-height: 1.5; text-wrap: balance; margin: 0; }
+h2 { color: var(--accent); font-size: 1.35rem; }
+h1 { font-size: 1.9rem; }
+h3 { font-size: 1.05rem; }
+p { margin: 0; max-width: 68ch; }
+a { color: var(--accent); }
+a:hover { color: var(--highlight-text); }
+.num, td.n, .data { font-family: var(--font-data); font-variant-numeric: tabular-nums; direction: ltr; unicode-bidi: isolate; }
+mark.ph { background: var(--warn-soft); color: var(--warn); outline: 1px dashed var(--warn); border-radius: 4px; padding: 0 4px; font-weight: 500; }
+header.top { display: grid; gap: 10px; background: var(--band); color: var(--band-fg); border-radius: 14px; padding: 28px 26px; border-bottom: 4px solid var(--highlight); }
+header.top h1 { color: var(--band-fg); }
+header.top .lede, header.top .eyebrow, header.top .meta { color: var(--band-muted); }
+header.top .pill.ok, header.top .pill.info { background: rgba(255,255,255,.14); color: var(--band-fg); }
+.eyebrow { color: var(--accent); font-weight: 600; font-size: .85rem; letter-spacing: .02em; }
+.meta { color: var(--muted); font-size: .92rem; display: flex; flex-wrap: wrap; gap: 6px 18px; }
+nav.toc { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 5; background: var(--bg); border-bottom: 1px solid var(--line); padding-block: 8px; margin-top: -20px; }
+nav.toc ul { list-style: none; margin: 0; padding: 0; display: flex; gap: 6px 14px; overflow-x: auto; white-space: nowrap; font-size: .88rem; }
+nav.toc a { color: var(--muted); text-decoration: none; padding: 4px 2px; display: inline-block; }
+nav.toc a:hover, nav.toc a:focus-visible { color: var(--highlight-text); }
+section { display: grid; gap: 16px; scroll-margin-top: 56px; }
+.lede { font-size: 1.08rem; }
+.verdict { background: var(--accent-soft); border-inline-start: 4px solid var(--accent); padding: 18px 20px; border-radius: 10px; display: grid; gap: 10px; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+.stat { background: var(--surface); border: 1px solid var(--line); border-top: 3px solid var(--accent); border-radius: 10px; padding: 14px 16px; display: grid; gap: 4px; align-content: start; }
+.stat .v { font-family: var(--font-data); font-size: 1.45rem; font-weight: 500; direction: ltr; text-align: right; color: var(--accent); }
+.stat .k { color: var(--muted); font-size: .88rem; line-height: 1.6; }
+.figure { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 16px; display: grid; gap: 10px; min-width: 0; position: relative; }
+.figure .cap { color: var(--muted); font-size: .88rem; }
+.figure .example { position: absolute; top: 10px; inset-inline-end: 12px; font-size: .75rem; font-weight: 600; color: var(--warn); background: var(--warn-soft); border: 1px dashed var(--warn); border-radius: 999px; padding: 0 10px; }
+.figure .nodata { color: var(--muted); font-size: .9rem; padding: 24px 0; text-align: center; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: .85rem; color: var(--muted); }
+.legend i { display: inline-block; width: 12px; height: 12px; border-radius: 2px; vertical-align: -1px; margin-inline-end: 6px; }
+.chart-wrap { overflow-x: auto; }
+.chart-wrap svg { display: block; width: 100%; min-width: 560px; height: auto; }
+.causes { display: grid; gap: 14px; }
+.cause { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; display: grid; gap: 8px; min-width: 0; }
+.cause-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px; }
+.pill { display: inline-block; font-size: .78rem; font-weight: 600; padding: 1px 10px; border-radius: 999px; white-space: nowrap; }
+.pill.crit { background: var(--crit-soft); color: var(--crit); }
+.pill.warn { background: var(--warn-soft); color: var(--warn); }
+.pill.ok { background: var(--ok-soft); color: var(--ok); }
+.pill.info { background: var(--accent-soft); color: var(--accent); }
+.cause dl { display: grid; grid-template-columns: 7.5em 1fr; gap: 4px 12px; margin: 0; font-size: .95rem; }
+.cause dt { color: var(--muted); }
+.cause dd { margin: 0; min-width: 0; }
+.ruled { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
+.ruled div { border: 1px dashed var(--line); border-radius: 10px; padding: 10px 14px; font-size: .94rem; }
+.ruled b { display: block; }
+.table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+table { width: 100%; border-collapse: collapse; font-size: .92rem; }
+th, td { text-align: start; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-weight: 600; color: var(--muted); font-size: .84rem; background: var(--bg); white-space: nowrap; }
+tr:last-child td { border-bottom: 0; }
+td.n { text-align: left; white-space: nowrap; }
+tr.phase td { background: var(--accent-soft); color: var(--accent); font-weight: 600; font-family: var(--font-display); font-size: .9rem; }
+.note { color: var(--muted); font-size: .9rem; }
+.steps { display: grid; gap: 10px; counter-reset: s; margin: 0; padding: 0; list-style: none; }
+.steps li { counter-increment: s; display: grid; grid-template-columns: 2rem 1fr; gap: 10px; align-items: start; }
+.steps li::before { content: counter(s); font-family: var(--font-data); width: 1.7rem; height: 1.7rem; border-radius: 50%; background: var(--accent-soft); color: var(--accent); display: grid; place-items: center; font-size: .85rem; }
+code { font-family: var(--font-data); font-size: .86em; background: var(--accent-soft); padding: 0 5px; border-radius: 4px; direction: ltr; unicode-bidi: isolate; }
+.ask { background: var(--surface); border: 1px solid var(--highlight); border-inline-start: 5px solid var(--highlight); border-radius: 10px; padding: 16px 18px; display: grid; gap: 8px; }
+.ask h3 { color: var(--highlight-text); }
+ul.bullets { margin: 0; padding-inline-start: 1.2em; display: grid; gap: 6px; max-width: 72ch; }
+footer { color: var(--band-muted); background: var(--band); font-size: .85rem; border-radius: 14px; padding: 18px 22px; display: grid; gap: 6px; }
+@media (max-width: 520px) {
+  h1 { font-size: 1.5rem; }
+  .cause dl { grid-template-columns: 1fr; }
+  .cause dt { margin-top: 6px; }
+}
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+html { scroll-behavior: smooth; }
+</style>
+
+<div class="page" dir="rtl" lang="ar">
+
+<header class="top">
+  <span class="eyebrow">تقرير فني للفريق · <mark class="ph">{{PLATFORM_NAME}}</mark></span>
+  <h1><mark class="ph">{{REPORT_TITLE مثال: تشخيص أداء المنصة}}</mark></h1>
+  <p class="lede"><mark class="ph">{{LEDE: جملة واحدة: ما السؤال الذي يجيب عنه التقرير، مثل: لماذا يشعر الطلاب ببطء المنصة، وما الذي سنصلحه وبأي ترتيب}}</mark></p>
+  <div class="meta">
+    <span>بيانات التشخيص: <mark class="ph">{{DATA_PERIOD مثال: 1–14 من الشهر}}</mark></span>
+    <span>الموقع: <mark class="ph">{{SITE}}</mark></span>
+    <span>الحالة: <span class="pill ok">الفحص مكتمل</span> <span class="pill info"><mark class="ph">{{STATUS_NOTE مثال: تحديث: بدأ تنفيذ الإصلاحات}}</mark></span></span>
+  </div>
+</header>
+
+<nav class="toc" aria-label="محتويات التقرير">
+  <ul>
+    <li><a href="#progress">ما نُفّذ</a></li>
+    <li><a href="#cdn">شبكة التوزيع</a></li>
+    <li><a href="#summary">الخلاصة</a></li>
+    <li><a href="#traffic">ما الذي تغيّر</a></li>
+    <li><a href="#causes">أسباب البطء</a></li>
+    <li><a href="#ruled-out">ما ليس سبباً</a></li>
+    <li><a href="#monitor">المراقبة</a></li>
+    <li><a href="#plan">خطة العمل</a></li>
+    <li><a href="#backup">النسخ الاحتياطي</a></li>
+    <li><a href="#ops">ملاحظات تشغيلية</a></li>
+    <li><a href="#projects">المشاريع على الخادم</a></li>
+    <li><a href="#method">المنهجية</a></li>
+  </ul>
+</nav>
+
+<!-- OPTIONAL: only after fixes started. Source: the operations log (times from the log entries, never estimates). -->
+<section id="progress" aria-labelledby="h-progress">
+  <h2 id="h-progress">ما نُفّذ حتى <mark class="ph">{{DATE}}</mark></h2>
+  <div class="verdict">
+    <p><strong>بدأ تنفيذ خطة الإصلاح <mark class="ph">{{WHEN مثال: فجر &lt;اليوم&gt; بين &lt;ساعة&gt; و&lt;ساعة&gt;}}</mark>.</strong> نُفّذ كل تغيير على حدة: نسخة احتياطية، ثم التغيير، ثم التحقق، مع طريقة رجوع جاهزة، وسُجّل كل تغيير في سجل العمليات على الخادم. <mark class="ph">{{DOWNTIME: مدة توقف الموقع في المجموع، أو: لم يتوقف الموقع}}</mark></p>
+    <p><strong>ما اكتمل:</strong> <mark class="ph">{{DONE_LIST}}</mark>. <strong>وما اكتمل جزئياً:</strong> <mark class="ph">{{PARTIAL_LIST}}</mark>. أثر التعديلات على زمن تجهيز الصفحات على الخادم يُقاس من سجلات الخادم بعد <span class="num"><mark class="ph">{{N}}</mark></span> ساعة، أما ما يشعر به الطلاب في المتصفح فيُقاس لاحقاً.</p>
+  </div>
+  <div class="stats">
+    <!-- repeat: one tile per measured effect; say what was measured, where and how many samples -->
+    <div class="stat"><span class="v"><mark class="ph">{{VALUE}}</mark></span><span class="k"><mark class="ph">{{WHAT_IT_MEASURES: مثال: عدد استعلامات قاعدة البيانات في الثانية بعد إعادة جدولة المهام (من … إلى …)، عينتان مدة كل منهما دقيقة في الساعة الهادئة نفسها}}</mark></span></div>
+    <div class="stat"><span class="v"><mark class="ph">{{VALUE}}</mark></span><span class="k"><mark class="ph">{{WHAT_IT_MEASURES}}</mark></span></div>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>المجال</th><th>ما نُفّذ</th><th>الحالة</th></tr></thead>
+      <tbody>
+        <tr class="phase"><td colspan="3">السرعة</td></tr>
+        <!-- repeat -->
+        <tr><td><mark class="ph">{{AREA}}</mark></td><td><mark class="ph">{{WHAT_WAS_DONE بلغة بسيطة}}</mark></td><td><span class="pill ok">نُفّذ</span> <mark class="ph">{{FOLLOW_UP مثال: مراقبة يومية 14 يوماً}}</mark></td></tr>
+        <tr class="phase"><td colspan="3">الحماية</td></tr>
+        <tr><td><mark class="ph">{{AREA}}</mark></td><td><mark class="ph">{{WHAT_WAS_DONE}}</mark></td><td><span class="pill ok">نُفّذ جزئياً</span> <mark class="ph">{{WHICH_PART}}</mark></td></tr>
+        <tr class="phase"><td colspan="3">التشغيل والتنظيف</td></tr>
+        <tr><td><mark class="ph">{{AREA}}</mark></td><td><mark class="ph">{{WHAT_WAS_DONE}}</mark></td><td><span class="pill info">اختبار تجريبي ناجح</span> <mark class="ph">{{CONFIRMED_AT: يُتأكد في التشغيل الفعلي التالي (الموعد)}}</mark></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <h3>التالي</h3>
+  <ul class="bullets">
+    <!-- repeat -->
+    <li><strong><mark class="ph">{{WHEN}}</mark>:</strong> <mark class="ph">{{NEXT_STEP}}</mark></li>
+    <li><strong><mark class="ph">{{WHEN}}</mark>، ليلة صيانة بإعلان مسبق للطلاب:</strong> <mark class="ph">{{MAINTENANCE_ITEMS}}</mark>. التوقف المتوقع <mark class="ph">{{MINUTES}}</mark> دقائق.</li>
+  </ul>
+</section>
+
+<!-- OPTIONAL: when the site moved (or will move) behind a CDN such as Cloudflare. -->
+<section id="cdn" aria-labelledby="h-cdn">
+  <h2 id="h-cdn">نقل النطاق إلى <mark class="ph">{{CDN_NAME مثال: Cloudflare}}</mark></h2>
+  <p><mark class="ph">{{CDN_INTRO: متى نُقل النطاق ومن نقله، وأن الشبكة صارت تقف بين الطالب والخادم: تستقبل الزيارة في مركز بيانات قريب، وترد من نسختها المخزّنة على ما يمكن، وتمرّر الباقي إلى الخادم}}</mark></p>
+  <div class="ruled">
+    <!-- repeat: one box per benefit or limit; say what is measured and what is not yet -->
+    <div><b>أقرب إلى الطالب</b><mark class="ph">{{TEXT: مراكز البيانات القريبة، وما زال الخادم يجهّز الصفحات من موقعه الحالي، ولم نقِس بعد الزمن الفعلي من بلد الطلاب}}</mark></div>
+    <div><b>حماية من الهجمات</b><mark class="ph">{{TEXT}}</mark></div>
+    <div><b>إخفاء عنوان الخادم</b><mark class="ph">{{TEXT: كامل أو جزئي، ولماذا}}</mark></div>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>ما ضُبط</th><th>لماذا</th></tr></thead>
+      <tbody>
+        <!-- repeat -->
+        <tr><td><mark class="ph">{{SETTING مثال: الخادم والمنصة يقرآن عنوان IP الحقيقي للطالب}}</mark></td><td><mark class="ph">{{WHY}}</mark></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note"><mark class="ph">{{COMPLIANCE_NOTE مثال: تفك الشبكة تشفير الزيارات في مراكزها، وقد تكون خارج البلد، وهذا بند في مراجعة الامتثال لحماية البيانات الشخصية}}</mark></p>
+</section>
+
+<section id="summary" aria-labelledby="h-summary">
+  <h2 id="h-summary">الخلاصة (تشخيص <mark class="ph">{{DIAGNOSIS_DATE}}</mark>)</h2>
+  <div class="verdict">
+    <p><strong><mark class="ph">{{VERDICT مثال: الخادم ليس مُرهقاً.}}</mark></strong> <mark class="ph">{{VERDICT_EVIDENCE: ما الذي تغيّر (الزيارات، الأجهزة) وما الذي لم يتغيّر (زمن الخادم، استهلاك المعالج)، بأرقام مع مصدرها وفترتها}}</mark></p>
+    <p>البطء الذي يشعر به الطلاب له <mark class="ph">{{N}}</mark> أسباب رئيسية: <mark class="ph">{{CAUSES_IN_ONE_SENTENCE_EACH}}</mark>. <mark class="ph">{{FIRST_FIXES مثال: الإصلاحات الأولى سريعة ومنخفضة المخاطر.}}</mark></p>
+  </div>
+  <div class="stats">
+    <!-- repeat: 4-6 tiles; value + plain sentence saying what, where (on the server / in the browser), period, n -->
+    <div class="stat"><span class="v"><mark class="ph">{{×N}}</mark></span><span class="k"><mark class="ph">{{مثال: زيادة الطلبات في الساعة بعد … (من … إلى …)}}</mark></span></div>
+    <div class="stat"><span class="v"><mark class="ph">{{0.00 s}}</mark></span><span class="k"><mark class="ph">{{مثال: 95% من الطلبات يجهّزها الخادم في أقل من … ث، وبقي ثابتاً مهما زاد عدد الطلبات}}</mark></span></div>
+    <div class="stat"><span class="v"><mark class="ph">{{0.00 s}}</mark></span><span class="k"><mark class="ph">{{مثال: زمن تجهيز صفحة … على الخادم، وسببه …}}</mark></span></div>
+    <div class="stat"><span class="v"><mark class="ph">{{~0 ms}}</mark></span><span class="k"><mark class="ph">{{مثال: زمن ذهاب البيانات وإيابها بين الطالب والخادم}}</mark></span></div>
+  </div>
+</section>
+
+<section id="traffic" aria-labelledby="h-traffic">
+  <h2 id="h-traffic">ما الذي تغيّر منذ <mark class="ph">{{CHANGE_DATE}}</mark></h2>
+  <p><mark class="ph">{{TRAFFIC_TEXT: متى بدأت الموجة ولماذا، ومن أين جاءت الزيادة (طلاب حقيقيون على الجوال أم برامج آلية)، مع نسب مقارنة بالقاعدة نفسها}}</mark></p>
+  <div class="figure" id="fig-days">
+    <div class="legend" aria-hidden="true">
+      <span><i style="background: var(--bar-mobile)"></i>متصفحات الجوال</span>
+      <span><i style="background: var(--bar-desktop)"></i>متصفحات الحاسوب</span>
+      <span><i style="background: var(--bar-other)"></i>أخرى (محركات بحث وبرامج)</span>
+      <span><i style="background: var(--line-p95); height: 3px; vertical-align: 3px"></i>زمن الخادم لـ 95% من طلبات اليوم</span>
+    </div>
+    <div class="chart-wrap"><svg id="chart-days" role="img" aria-label="الطلبات اليومية مقسمة حسب نوع الجهاز، مع زمن الخادم"></svg></div>
+    <p class="cap"><mark class="ph">{{CAPTION: الفترة، وأيام كاملة فقط، وما يعنيه الخط (زمن الخادم لـ 95% من طلبات اليوم كله)، وتنبيه إن تغيّر مزيج الطلبات}}</mark></p>
+  </div>
+</section>
+
+<section id="causes" aria-labelledby="h-causes">
+  <h2 id="h-causes">أسباب البطء مرتبة حسب ما يشعر به الطالب</h2>
+  <div class="figure" id="fig-pages">
+    <h3>كم ينتظر الطالب الخادمَ في كل صفحة؟</h3>
+    <div class="chart-wrap"><svg id="chart-pages" role="img" aria-label="الزمن الوسيط لتجهيز أهم الصفحات على الخادم"></svg></div>
+    <p class="cap">الزمن الوسيط على الخادم (نصف الطلبات أسرع منه) خلال <mark class="ph">{{PERIOD}}</mark>. لا يشمل زمن الشبكة ولا تحميل الصفحة في المتصفح.</p>
+  </div>
+  <div class="causes">
+    <!-- repeat: one card per cause, ranked by impact on students; pill: crit (high), warn (medium), info (low) -->
+    <article class="cause">
+      <div class="cause-head"><h3>1. <mark class="ph">{{CAUSE_TITLE}}</mark></h3><span class="pill crit"><mark class="ph">{{IMPACT مثال: أثر عالٍ على كل زيارة}}</mark></span></div>
+      <dl>
+        <dt>ما يحدث</dt><dd><mark class="ph">{{WHAT_HAPPENS بلغة بسيطة}}</mark></dd>
+        <dt>الدليل</dt><dd><mark class="ph">{{EVIDENCE: أرقام مع ما تقيسه وأين ومتى وعدد العينات}}</mark></dd>
+        <dt>الإصلاح</dt><dd><mark class="ph">{{FIX ومن يقرره}}</mark></dd>
+      </dl>
+    </article>
+    <article class="cause">
+      <div class="cause-head"><h3>2. <mark class="ph">{{CAUSE_TITLE}}</mark></h3><span class="pill warn"><mark class="ph">{{IMPACT}}</mark></span></div>
+      <dl>
+        <dt>ما يحدث</dt><dd><mark class="ph">{{WHAT_HAPPENS}}</mark></dd>
+        <dt>الدليل</dt><dd><mark class="ph">{{EVIDENCE}}</mark></dd>
+        <dt>الإصلاح</dt><dd><mark class="ph">{{FIX}}</mark></dd>
+      </dl>
+    </article>
+  </div>
+</section>
+
+<section id="ruled-out" aria-labelledby="h-ruled">
+  <h2 id="h-ruled">ما ليس سبباً (بالدليل)</h2>
+  <div class="ruled">
+    <!-- repeat -->
+    <div><b>قدرة الخادم</b><mark class="ph">{{EVIDENCE: متوسط المعالج في أكثر الساعات ازدحاماً، وهل انتظر أي طلب دوره في PHP، والذاكرة المتاحة}}</mark></div>
+    <div><b>قاعدة البيانات</b><mark class="ph">{{EVIDENCE}}</mark></div>
+    <div><b>المشاريع الأخرى</b><mark class="ph">{{EVIDENCE}}</mark></div>
+    <div><b>حجم الحركة نفسه</b><mark class="ph">{{EVIDENCE}}</mark></div>
+  </div>
+  <p class="note"><mark class="ph">{{UNCERTAIN_NOTE: ما لم يُحسم بعد، ويُكتب بوضوح أنه غير مؤكد}}</mark></p>
+</section>
+
+<section id="monitor" aria-labelledby="h-monitor">
+  <h2 id="h-monitor">المراقبة على مدى <mark class="ph">{{HOURS}}</mark> ساعة</h2>
+  <p><mark class="ph">{{MONITOR_TEXT: من متى إلى متى، عينة كل دقيقة وقياس صفحات كل 5 دقائق، هل انقطعت، وهل اقتربت المنصة من حدودها}}</mark></p>
+  <div class="stats">
+    <!-- repeat -->
+    <div class="stat"><span class="v"><mark class="ph">{{0.00 s}}</mark></span><span class="k"><mark class="ph">{{مثال: زمن بدء الاستجابة للصفحة الرئيسية مقابل … لصفحة الدخول (وسيط … قياساً)}}</mark></span></div>
+    <div class="stat"><span class="v"><mark class="ph">{{0.0%}}</mark></span><span class="k"><mark class="ph">{{مثال: متوسط استخدام المعالج في أكثر الساعات ازدحاماً}}</mark></span></div>
+    <div class="stat"><span class="v"><mark class="ph">{{0 من N}}</mark></span><span class="k"><mark class="ph">{{مثال: دقيقة رُصد فيها طلب ينتظر دوره في معالجة PHP}}</mark></span></div>
+  </div>
+  <div class="figure" id="fig-monitor">
+    <h3><mark class="ph">{{CHART3_TITLE مثال: زمن الصفحة الرئيسية لا يتبع عدد الطلبات}}</mark></h3>
+    <div class="legend" aria-hidden="true">
+      <span><i style="background: var(--bar-desktop)"></i>طلبات PHP في الساعة (سجلات الخادم)</span>
+      <span><i style="background: var(--line-p95); height: 3px; vertical-align: 3px"></i>الصفحة الرئيسية</span>
+      <span><i style="background: var(--accent); height: 3px; vertical-align: 3px"></i>صفحة الدخول</span>
+    </div>
+    <div class="chart-wrap"><svg id="chart-monitor" role="img" aria-label="زمن بدء الاستجابة للصفحة الرئيسية وصفحة الدخول في كل ساعة، مع عدد طلبات PHP"></svg></div>
+    <p class="cap"><mark class="ph">{{CAPTION: وسيط كل ساعة من … قياساً من الخادم نفسه، والفترة، ومدى تغيّر الطلبات}}</mark></p>
+  </div>
+  <ul class="bullets">
+    <!-- repeat -->
+    <li><mark class="ph">{{FINDING}}</mark></li>
+    <li>أهدأ الأوقات <mark class="ph">{{QUIET_WINDOW مثال: بين 2 و6 فجراً بتوقيت …}}</mark>، وفيها ننفّذ الأعمال الحساسة.</li>
+  </ul>
+  <p class="note">حدود القياس: <mark class="ph">{{LIMITS: مستوى الحمل أثناء المراقبة مقارنة بأعلى ذروة، والقياس من الخادم نفسه فلا يشمل الشبكة إلى الطلاب، والعينة كل دقيقة فقد تفوتها اختناقات تدوم ثوانيَ}}</mark></p>
+</section>
+
+<section id="plan" aria-labelledby="h-plan">
+  <h2 id="h-plan">خطة العمل</h2>
+  <p>اعتمدها المالك يوم <mark class="ph">{{APPROVAL_DATE}}</mark>. ننفّذ مهمة واحدة في كل مرة: خطة بالأوامر الدقيقة، ثم موافقة، ثم تنفيذ، ثم قياس قبل وبعد، ثم ننتقل للتالية. والتعديلات الحساسة في الساعات الهادئة (<mark class="ph">{{QUIET_WINDOW}}</mark>).</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>الإجراء</th><th>الأثر المتوقع</th><th>المخاطرة</th><th>الحالة</th></tr></thead>
+      <tbody>
+        <tr class="phase"><td colspan="5">المرحلة 1 — إصلاحات سريعة على الخادم</td></tr>
+        <!-- repeat; risk pill: ok (low), warn (medium), crit (high); status: نُفّذ / نُفّذ جزئياً / مجدول / بانتظار قرار / بانتظار التنفيذ -->
+        <tr><td class="n">1</td><td><mark class="ph">{{ACTION}}</mark></td><td><mark class="ph">{{EXPECTED_EFFECT}}</mark></td><td><span class="pill ok">منخفضة</span></td><td><mark class="ph">{{STATUS}}</mark></td></tr>
+        <tr class="phase"><td colspan="5">المرحلة 2 — ما يشعر به الطالب في المتصفح</td></tr>
+        <tr><td class="n">2</td><td><mark class="ph">{{ACTION}}</mark></td><td><mark class="ph">{{EXPECTED_EFFECT}}</mark></td><td><span class="pill warn">متوسطة</span></td><td><mark class="ph">{{STATUS}}</mark></td></tr>
+        <tr class="phase"><td colspan="5">المرحلة 3 — ليلة صيانة واحدة بإعلان مسبق</td></tr>
+        <tr><td class="n">3</td><td><mark class="ph">{{ACTION}}</mark></td><td><mark class="ph">{{EXPECTED_EFFECT}}</mark></td><td><span class="pill warn">متوسطة (توقف مخطط)</span></td><td><span class="pill info"><mark class="ph">{{مجدول DATE}}</mark></span></td></tr>
+        <tr class="phase"><td colspan="5">المرحلة 4 — بعد الإصلاحات</td></tr>
+        <tr><td class="n">4</td><td>قياس «بعد»: مراقبة <mark class="ph">{{HOURS}}</mark> ساعة وجمع جديد، ومقارنتها بأرقام هذا التقرير</td><td>تقرير ختامي بالأثر الفعلي</td><td>—</td><td>مخطط</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- OPTIONAL: from the backup module -->
+<section id="backup" aria-labelledby="h-backup">
+  <h2 id="h-backup">النسخ الاحتياطي</h2>
+  <p><mark class="ph">{{BACKUP_TEXT: ما هو قائم الآن (مثل نسخة المزوّد اليومية) وحدوده، والقرار المتخذ لطبقة ثانية لدى مزوّد مختلف}}</mark></p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>البند</th><th>القرار</th></tr></thead>
+      <tbody>
+        <!-- repeat: layers, schedule, content, retention, encryption, alerting, restore test, cost -->
+        <tr><td><mark class="ph">{{ITEM}}</mark></td><td><mark class="ph">{{DECISION}}</mark></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="ask">
+    <h3>مطلوب من الإدارة: <mark class="ph">{{ASK_TITLE}}</mark></h3>
+    <p><mark class="ph">{{ASK_TEXT: ما المطلوب ولماذا ومرة واحدة أم دائماً}}</mark></p>
+    <ul class="bullets">
+      <li><mark class="ph">{{ASK_ITEM}}</mark></li>
+    </ul>
+    <p class="note">لا نطلب كلمة مرور أي حساب. ينفّذ المسؤول الخطوات بنفسه وفق دليل مكتوب بالعربية.</p>
+  </div>
+</section>
+
+<section id="ops" aria-labelledby="h-ops">
+  <h2 id="h-ops">ملاحظات تشغيلية</h2>
+  <p>أمور لا تسبب البطء مباشرة لكنها تحتاج معالجة. عمود الحالة محدّث في <mark class="ph">{{DATE}}</mark>.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>الملاحظة</th><th>الأهمية</th><th>التفاصيل</th><th>الحالة</th></tr></thead>
+      <tbody>
+        <!-- repeat; importance pill: warn (متوسطة / أمنية), info (منخفضة) -->
+        <tr><td><mark class="ph">{{NOTE}}</mark></td><td><span class="pill warn">متوسطة</span></td><td><mark class="ph">{{DETAILS}}</mark></td><td><mark class="ph">{{STATUS}}</mark></td></tr>
+        <tr><td><mark class="ph">{{NOTE}}</mark></td><td><span class="pill warn">أمنية</span></td><td><mark class="ph">{{DETAILS}}</mark></td><td><mark class="ph">{{STATUS}}</mark></td></tr>
+        <tr><td><mark class="ph">{{NOTE}}</mark></td><td><span class="pill info">منخفضة</span></td><td><mark class="ph">{{DETAILS}}</mark></td><td><mark class="ph">{{STATUS}}</mark></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- OPTIONAL: other projects on the same server (only names the owner wants in a team document) -->
+<section id="projects" aria-labelledby="h-projects">
+  <h2 id="h-projects">المشاريع المستضافة على الخادم</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>المشروع</th><th>النطاق</th><th>التقنية</th><th>الحالة</th></tr></thead>
+      <tbody>
+        <tr><td><mark class="ph">{{PLATFORM_NAME}}</mark> (Moodle <mark class="ph">{{VERSION}}</mark>)</td><td><mark class="ph">{{SITE}}</mark></td><td><mark class="ph">{{STACK مثال: PHP 8.x، MariaDB، Redis}}</mark></td><td><span class="pill ok">نشط — موضوع هذا التقرير</span></td></tr>
+        <!-- repeat -->
+        <tr><td><mark class="ph">{{PROJECT}}</mark></td><td><mark class="ph">{{DOMAIN}}</mark></td><td><mark class="ph">{{STACK}}</mark></td><td><mark class="ph">{{STATUS}}</mark></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="method" aria-labelledby="h-method">
+  <h2 id="h-method">المنهجية</h2>
+  <ol class="steps">
+    <li><span>فحص أولي بالقراءة فقط لموارد الخادم وإعدادات خادم الويب وPHP وقاعدة البيانات وMoodle، وجرد المشاريع.</span></li>
+    <li><span>سكربت جمع للقراءة فقط شغّله مدير الخادم: سجلات <mark class="ph">{{N}}</mark> يوماً مجمّعة، مع إخفاء عناوين IP والبريد والجوالات وكلمات المرور قبل أي تحليل.</span></li>
+    <li><span>مراقبة خفيفة لمدة <mark class="ph">{{HOURS}}</mark> ساعة (<mark class="ph">{{DATES}}</mark>) توقفت تلقائياً دون أن تغيّر أي إعداد.</span></li>
+    <li><span><mark class="ph">{{SECOND_COLLECTION: جمع ثانٍ بالطريقة نفسها يغطي فترة المراقبة، إن أُجري}}</mark></span></li>
+    <li><span>تحليل مستقل لكل مجال (الحركة، PHP، قاعدة البيانات، التشغيل، المراقبة)، مع مدقق مستقل يعيد حساب الأرقام ويحاول نقضها قبل اعتمادها، ومراجعة التقرير مقابل سجل العمليات قبل نشره.</span></li>
+  </ol>
+  <p class="note">لم يُجرِ فريق الفحص أي تعديل على إعدادات الخادم أثناء الفحص (<mark class="ph">{{AUDIT_DATES}}</mark>) سوى مراقبة مؤقتة انتهت تلقائياً. <mark class="ph">{{OUTSIDE_CHANGES: تغييرات خارج الفحص ومن أجراها، مثل تحديثات تلقائية}}</mark> وكل تعديل بعد ذلك جرى بعد موافقة المالك على كل بند، ومسجّل في سجل العمليات على الخادم مع نسخته الاحتياطية وطريقة الرجوع عنه. الأرقام الواردة مجمّعة ولا تحتوي بيانات شخصية.</p>
+</section>
+
+<footer>
+  <span>أُعدّ هذا التقرير لفريق <mark class="ph">{{PLATFORM_NAME}}</mark>. التشخيص: <mark class="ph">{{DIAGNOSIS_DATE}}</mark>. آخر تحديث: <mark class="ph">{{LAST_UPDATE وما الذي تغيّر فيه}}</mark>.</span>
+  <span>سيصدر تقرير ختامي بالأثر الفعلي بعد تنفيذ الإصلاحات وإعادة القياس.</span>
+</footer>
+
+</div>
+
+<script>
+(function () {
+  // ===== CHART DATA (references/team-page.md §3). EXAMPLE values: replace them, then set example: false. =====
+  var DATA = {
+    example: true,
+    // Chart 1: one entry per FULL day. d = "MM-DD"; total, mobile, desktop = requests (other = total - mobile - desktop);
+    // p95 = server time (urt) p95 of the whole day in seconds. Sources: per_day.tsv, ua_classes_daily.tsv.
+    days: [
+      { d: "01-01", total: 10000, mobile: 5000, desktop: 4000, p95: 0.50 },
+      { d: "01-02", total: 11000, mobile: 5500, desktop: 4500, p95: 0.50 },
+      { d: "01-03", total: 12000, mobile: 6000, desktop: 5000, p95: 0.50 },
+      { d: "01-04", total: 30000, mobile: 20000, desktop: 8000, p95: 0.60 },
+      { d: "01-05", total: 40000, mobile: 28000, desktop: 10000, p95: 0.60 },
+      { d: "01-06", total: 28000, mobile: 19000, desktop: 7000, p95: 0.55 }
+    ],
+    eventIndex: 3,            // index in days[] where a launch/change happened (-1: none)
+    eventLabel: "{{EVENT_LABEL مثال: حدث أو تغيير}}",
+    daysAxisLabel: "اليوم",
+    // Chart 2: [label, median server time in seconds] per page. Source: endpoint_summary_P1.tsv (urt_p50).
+    pages: [
+      ["صفحة الدخول", 0.10],
+      ["طلبات AJAX داخل المنصة", 0.05],
+      ["صفحة المقرر", 0.40],
+      ["الصفحة الرئيسية", 1.00],
+      ["إرسال استمارة إنشاء الحساب", 1.50]
+    ],
+    slowThreshold: 0.7,       // bars at or above this many seconds are drawn in the "critical" colour
+    // Chart 3: [hour label "Day HH", front page TTFB median s, login TTFB median s, PHP requests that hour].
+    // Sources: ttfb.csv (median per clock hour), per_hour.tsv (php_req). Day keys must exist in dayNames.
+    monitor: [
+      ["Sat 06", 0.50, 0.20, 1000], ["Sat 12", 0.52, 0.21, 2000], ["Sat 18", 0.51, 0.20, 2000],
+      ["Sun 00", 0.50, 0.20, 1000], ["Sun 06", 0.50, 0.20, 1000], ["Sun 12", 0.52, 0.21, 2000],
+      ["Sun 18", 0.51, 0.20, 2000], ["Mon 00", 0.50, 0.20, 1000], ["Mon 06", 0.50, 0.20, 1000]
+    ],
+    dayNames: { Sat: "السبت", Sun: "الأحد", Mon: "الاثنين", Tue: "الثلاثاء", Wed: "الأربعاء", Thu: "الخميس", Fri: "الجمعة" },
+    monitorAxisLabel: "{{MONITOR_AXIS مثال: الساعة (1–3 من الشهر، بتوقيت …)}}"
+  };
+  // ===== end of chart data =====
+
+  var NS = "http://www.w3.org/2000/svg";
+  var FONT_DATA = "IBM Plex Mono, monospace", FONT_TEXT = getComputedStyle(document.body).fontFamily;
+  function el(name, attrs, text) {
+    var e = document.createElementNS(NS, name);
+    for (var k in attrs) e.setAttribute(k, attrs[k]);
+    if (text != null) e.textContent = text;
+    return e;
+  }
+  function fmtK(v) { return v >= 1000 ? Math.round(v / 1000) + "k" : String(v); }
+  function niceMax(v) { // round up to 1, 2, 2.5, 5 x 10^n
+    if (!(v > 0)) return 1;
+    var p = Math.pow(10, Math.floor(Math.log(v) / Math.LN10)), m = v / p;
+    return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 2.5 ? 2.5 : m <= 5 ? 5 : 10) * p;
+  }
+  function ticks(max, n) { var out = []; for (var i = 0; i <= n; i++) out.push(max * i / n); return out; }
+  function prepare(figId, svgId, ok) {
+    var fig = document.getElementById(figId), svg = document.getElementById(svgId);
+    if (!fig || !svg) return null;
+    if (DATA.example) fig.insertAdjacentHTML("afterbegin", '<span class="example">بيانات مثال — للاستبدال</span>');
+    if (!ok) { svg.parentNode.outerHTML = '<p class="nodata">لا توجد بيانات لهذا الرسم.</p>'; return null; }
+    svg.setAttribute("direction", "ltr");
+    return svg;
+  }
+
+  // Chart 1: daily requests (stacked) + server p95 line, chronological left to right.
+  (function () {
+    var D = DATA.days || [], svg = prepare("fig-days", "chart-days", D.length > 0);
+    if (!svg) return;
+    var W = 720, H = 300, m = { l: 52, r: 52, t: 16, b: 40 };
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    var iw = W - m.l - m.r, ih = H - m.t - m.b;
+    var maxY = niceMax(Math.max.apply(null, D.map(function (r) { return r.total; })));
+    var maxP = niceMax(Math.max.apply(null, D.map(function (r) { return r.p95 || 0; })));
+    var y = function (v) { return m.t + ih - (v / maxY) * ih; };
+    var yp = function (v) { return m.t + ih - (v / maxP) * ih; };
+    var bw = iw / D.length, g = el("g", {});
+    ticks(maxY, 4).forEach(function (t) {
+      g.appendChild(el("line", { x1: m.l, x2: W - m.r, y1: y(t), y2: y(t), stroke: "var(--line)", "stroke-width": 1 }));
+      g.appendChild(el("text", { x: m.l - 8, y: y(t) + 4, "text-anchor": "end", "font-size": 11, fill: "var(--muted)", "font-family": FONT_DATA }, fmtK(t)));
+    });
+    ticks(maxP, 4).forEach(function (t) {
+      g.appendChild(el("text", { x: W - m.r + 8, y: yp(t) + 4, "text-anchor": "start", "font-size": 11, fill: "var(--line-p95)", "font-family": FONT_DATA }, t.toFixed(2) + "s"));
+    });
+    var every = Math.ceil(D.length / 16);
+    D.forEach(function (r, i) {
+      var x = m.l + i * bw + bw * 0.15, w = bw * 0.7, cur = y(0);
+      var other = Math.max(0, r.total - (r.mobile || 0) - (r.desktop || 0));
+      [[r.mobile || 0, "var(--bar-mobile)"], [r.desktop || 0, "var(--bar-desktop)"], [other, "var(--bar-other)"]].forEach(function (s) {
+        var h = (s[0] / maxY) * ih;
+        var rect = el("rect", { x: x, y: cur - h, width: w, height: Math.max(0, h), fill: s[1] });
+        rect.appendChild(el("title", {}, r.d + ": " + s[0].toLocaleString("en-US")));
+        g.appendChild(rect); cur -= h;
+      });
+      if (i % every === 0) g.appendChild(el("text", { x: x + w / 2, y: H - m.b + 16, "text-anchor": "middle", "font-size": 10.5, fill: "var(--muted)", "font-family": FONT_DATA }, r.d));
+    });
+    var pts = D.map(function (r, i) { return (m.l + i * bw + bw / 2) + "," + yp(r.p95 || 0); }).join(" ");
+    g.appendChild(el("polyline", { points: pts, fill: "none", stroke: "var(--line-p95)", "stroke-width": 2.5, "stroke-linejoin": "round" }));
+    D.forEach(function (r, i) { g.appendChild(el("circle", { cx: m.l + i * bw + bw / 2, cy: yp(r.p95 || 0), r: 3, fill: "var(--line-p95)" })); });
+    if (DATA.eventIndex >= 0 && DATA.eventIndex < D.length) {
+      var ex = m.l + DATA.eventIndex * bw;
+      g.appendChild(el("line", { x1: ex, x2: ex, y1: m.t, y2: m.t + ih, stroke: "var(--accent)", "stroke-dasharray": "4 4", "stroke-width": 1.5 }));
+      g.appendChild(el("text", { x: ex + 6, y: m.t + 12, "font-size": 11.5, fill: "var(--accent)", "font-family": FONT_TEXT, "text-anchor": "start" }, DATA.eventLabel));
+    }
+    g.appendChild(el("text", { x: m.l + iw / 2, y: H - 6, "text-anchor": "middle", "font-size": 11, fill: "var(--muted)", "font-family": FONT_TEXT }, DATA.daysAxisLabel));
+    svg.appendChild(g);
+  })();
+
+  // Chart 2: median server time per page (horizontal bars, fastest first).
+  (function () {
+    var P = (DATA.pages || []).slice(), svg = prepare("fig-pages", "chart-pages", P.length > 0);
+    if (!svg) return;
+    P.sort(function (a, b) { return a[1] - b[1]; });
+    var W = 720, rowH = 34, m = { l: 210, r: 70, t: 8, b: 30 }, H = m.t + m.b + rowH * P.length;
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    var iw = W - m.l - m.r, maxX = niceMax(P[P.length - 1][1]);
+    var x = function (v) { return m.l + (v / maxX) * iw; }, g = el("g", {});
+    ticks(maxX, 5).forEach(function (t) {
+      g.appendChild(el("line", { x1: x(t), x2: x(t), y1: m.t, y2: H - m.b, stroke: "var(--line)", "stroke-width": 1 }));
+      g.appendChild(el("text", { x: x(t), y: H - m.b + 16, "text-anchor": "middle", "font-size": 11, fill: "var(--muted)", "font-family": FONT_DATA }, +t.toFixed(2) + "s"));
+    });
+    P.forEach(function (p, i) {
+      var yy = m.t + i * rowH + 6, h = rowH - 12, slow = p[1] >= DATA.slowThreshold;
+      g.appendChild(el("text", { x: m.l - 12, y: yy + h / 2 + 4, "text-anchor": "end", "font-size": 13, fill: "var(--fg)", "font-family": FONT_TEXT }, p[0]));
+      g.appendChild(el("rect", { x: m.l, y: yy, width: Math.max(2, x(p[1]) - m.l), height: h, rx: 3, fill: slow ? "var(--crit)" : "var(--accent)", opacity: slow ? 0.9 : 0.75 }));
+      g.appendChild(el("text", { x: x(p[1]) + 8, y: yy + h / 2 + 4, "text-anchor": "start", "font-size": 12, fill: "var(--fg)", "font-family": FONT_DATA }, p[1].toFixed(2) + "s"));
+    });
+    svg.appendChild(g);
+  })();
+
+  // Chart 3: monitor hours: PHP requests per hour as bars (right axis), front page and login TTFB lines (left axis).
+  (function () {
+    var R = DATA.monitor || [], svg = prepare("fig-monitor", "chart-monitor", R.length > 0);
+    if (!svg) return;
+    var W = 720, H = 300, m = { l: 52, r: 56, t: 16, b: 44 };
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    var iw = W - m.l - m.r, ih = H - m.t - m.b, bw = iw / R.length;
+    var maxS = niceMax(Math.max.apply(null, R.map(function (r) { return Math.max(r[1], r[2]); })) * 1.2);
+    var maxR = niceMax(Math.max.apply(null, R.map(function (r) { return r[3]; })));
+    var ys = function (v) { return m.t + ih - (v / maxS) * ih; }, yr = function (v) { return m.t + ih - (v / maxR) * ih; };
+    var g = el("g", {});
+    ticks(maxS, 4).forEach(function (t) {
+      g.appendChild(el("line", { x1: m.l, x2: W - m.r, y1: ys(t), y2: ys(t), stroke: "var(--line)", "stroke-width": 1 }));
+      g.appendChild(el("text", { x: m.l - 8, y: ys(t) + 4, "text-anchor": "end", "font-size": 11, fill: "var(--muted)", "font-family": FONT_DATA }, t.toFixed(1) + "s"));
+    });
+    ticks(maxR, 4).forEach(function (t) {
+      g.appendChild(el("text", { x: W - m.r + 8, y: yr(t) + 4, "text-anchor": "start", "font-size": 11, fill: "var(--muted)", "font-family": FONT_DATA }, fmtK(t)));
+    });
+    var every = Math.max(1, Math.round(R.length / 8));
+    R.forEach(function (r, i) {
+      var x = m.l + i * bw + bw * 0.12, w = bw * 0.76, h = (r[3] / maxR) * ih;
+      var rect = el("rect", { x: x, y: m.t + ih - h, width: w, height: h, fill: "var(--bar-desktop)", opacity: 0.55 });
+      rect.appendChild(el("title", {}, r[0] + ": " + r[3].toLocaleString("en-US") + " PHP/h, " + r[1] + "s / " + r[2] + "s"));
+      g.appendChild(rect);
+      if (i % every === 0) {
+        var parts = r[0].split(" ");
+        g.appendChild(el("text", { x: x + w / 2, y: H - m.b + 16, "text-anchor": "middle", "font-size": 10.5, fill: "var(--muted)", "font-family": FONT_TEXT }, (DATA.dayNames[parts[0]] || parts[0]) + " " + (parts[1] || "")));
+        g.appendChild(el("line", { x1: x + w / 2, x2: x + w / 2, y1: m.t + ih, y2: m.t + ih + 4, stroke: "var(--muted)" }));
+      }
+    });
+    [[1, "var(--line-p95)"], [2, "var(--accent)"]].forEach(function (s) {
+      var pts = R.map(function (r, i) { return (m.l + i * bw + bw / 2) + "," + ys(r[s[0]]); }).join(" ");
+      g.appendChild(el("polyline", { points: pts, fill: "none", stroke: s[1], "stroke-width": 2.5, "stroke-linejoin": "round" }));
+    });
+    g.appendChild(el("text", { x: m.l + iw / 2, y: H - 6, "text-anchor": "middle", "font-size": 11, fill: "var(--muted)", "font-family": FONT_TEXT }, DATA.monitorAxisLabel));
+    svg.appendChild(g);
+  })();
+})();
+</script>

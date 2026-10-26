@@ -1,0 +1,5 @@
+# pre-patch sha256, post-patch sha256, path relative to the Moodle web root.
+# marker: MYORG-PATCH
+# theme/example: release 1.2.3, version 2026010100
+# Written by "vendorpatch.sh pin <name>.diff" on the exact vendor release; do not edit the hashes by hand.
+0000000000000000000000000000000000000000000000000000000000000000 1111111111111111111111111111111111111111111111111111111111111111 theme/example/classes/coursehandler.php

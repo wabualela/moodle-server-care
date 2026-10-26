@@ -1,0 +1,4 @@
+# /etc/sudoers.d/90-@USER@-nopasswd  (root:root 0440)  -- TEMPORARY, removed by revoke-@USER@-nopasswd-sudo.timer at @UNTIL@
+# moodle-server-care (skills/maintenance, references/temporary-sudo.md). Install ONLY on the owner's explicit request,
+# with visudo -cf before moving it in place. It does not widen the working rules: every change still needs approval.
+@USER@ ALL=(ALL:ALL) NOPASSWD: ALL

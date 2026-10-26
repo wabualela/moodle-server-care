@@ -1,0 +1,24 @@
+# moodle-health: one-minute health check, reports to healthchecks.io (settings: /etc/default/moodle-health).
+# Installed by the moodle-server-care "monitoring" module (scripts/install.sh).
+[Unit]
+Description=Moodle server health check (reports to healthchecks.io)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/moodle-health
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+# The script stops starting new probes after 40 s; this is the hard limit so a run never overlaps the next one.
+TimeoutStartSec=55
+# Root is needed to read logs, the mail queue and fail2ban; it writes only its state directory.
+StateDirectory=moodle-health
+StateDirectoryMode=0700
+UMask=0077
+PrivateTmp=yes
+ProtectSystem=full
+# install.sh switches this to read-only when Moodle, its dataroot or a watched log lives under /home.
+ProtectHome=yes
+NoNewPrivileges=yes

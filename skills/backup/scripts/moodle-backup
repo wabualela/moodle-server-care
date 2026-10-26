@@ -1,0 +1,854 @@
+#!/bin/bash
+set +x   # never trace: HC_URL is semi-secret and the run reads paths that hold credentials
+# moodle-backup: nightly encrypted off-provider backup of ONE Moodle site with rclone crypt, to either
+#   - a SharePoint document library (Microsoft 365; rclone "onedrive" backend, drive_type=documentLibrary), or
+#   - an S3-compatible bucket (Cloudflare R2 or similar; rclone "s3" backend).
+# Part of the moodle-server-care plugin (skills/backup). Design, install, restore: skills/backup/references/.
+#
+# Installed as /usr/local/sbin/<NAME> (root:root 0700). <NAME> is this file's own name (default moodle-backup); it
+# selects /etc/default/<NAME> (settings, root 0600), /var/lib/<NAME> (state, rclone config) and /var/backups/<NAME>
+# (local staging, 0700). Started by <NAME>.timer inside the server's measured quiet window; <NAME>.service has a hard
+# stop (TimeoutStartSec) that ends before the unattended-upgrades window.
+#
+# Night run, in order (a failure stops the run and pings the heartbeat /fail; OnFailure= starts <NAME>-alert):
+#   1. preflight: tools, settings, rclone config (directory writable: Microsoft rolls refresh tokens and rclone writes
+#      the new one back), the crypt passphrases open the existing backups (keycheck object, or names that decrypt;
+#      never "a manifest exists"), HC_URL, filedir present, lock, disk, time.
+#   2. DB dump (MariaDB/MySQL, --single-transaction: no table locks) -> zstd; checked: zstd -t, "-- Dump completed"
+#      trailer, CREATE TABLE count = information_schema count, shrink guard. Plus the DB accounts (MariaDB only).
+#   3. optional SQLite databases of other apps on the server (online-backup API, quick_check).
+#   4. config bundle (tar.zst): config.php, moodledata without filedir and caches (keeps secret/, muc/, lang/), the
+#      /etc configs listed in CONFIG_PATHS, these scripts, crontabs, handbook + log, package lists. Credential files of
+#      the MTA and rclone are excluded and the run fails if one slips in.
+#   5. upload the set to daily/ with the manifest LAST (it marks the set complete); weekly/ when the weekly day comes
+#      and the newest weekly is >= 48 h old, or whenever it is older than WEEKLY_MAX_HOURS; monthly/ when the month has
+#      none yet. Never by calendar alone, so one failed night leaves no gap.
+#   6. code tree without .git to code/ on weekly days and whenever the tree changed since the last upload.
+#   7. filedir mirror WITHOUT listing the whole remote every night (filedir is content-addressed):
+#        a. new files = local list minus the model of the remote (state file) -> copy --files-from-raw --no-traverse
+#        b. SLICES=16 (SharePoint): one sixteenth (first hex digit = day number mod 16) is synced in full each night;
+#           SLICES=1 (S3): the whole tree is synced each night (cheap: S3 lists 1000 objects per request).
+#           Files removed locally move to filedir-deleted/<run>/; files missing remotely are uploaded again (drift).
+#      Guards computed LOCALLY before anything moves: total file count, slice count, expected removals vs MAX_DELETE.
+#      --max-delete stays on the sync as a second line of defence. The DB dump is taken BEFORE the filedir steps.
+#   8. retention (<NAME>-retention): only complete sets count; --apply (SharePoint) or --check --lifecycle (S3 with
+#      lifecycle + lock rules on the bucket).
+#   9. token write-back check (SharePoint), status file, heartbeat (success, or /fail with the log on warnings).
+#
+# Secrets: none in this file or in /etc/default/<NAME>. The Microsoft token / S3 keys and the two crypt passphrases live
+# only in $RCLONE_CONF (root 0600, directory 0700), written by the OWNER with owner-setup-sharepoint.sh or
+# owner-setup-s3.sh. The DB is read as root over the unix socket (no password), or with DB_DEFAULTS_FILE (root 0600)
+# written by the owner. HC_URL reaches curl on a pipe (-K), never as an argument.
+#
+# Usage: <NAME> [--dry-run | --preflight | --reconcile [HOURS] | --alert]
+#   (none)       night run (what the timer does)
+#   --dry-run    dump + bundle locally; rclone runs with --dry-run: nothing is uploaded, moved or deleted remotely
+#   --preflight  read-only checks (settings, rclone config, connection, passphrases, HC_URL with a /log ping, paths)
+#   --reconcile  lists the whole filedir mirror once, uploads only what is missing (first seed, new server, lost
+#                state); refuses when more than MAX_DELETE mirror files are missing locally (filedir copied only in
+#                part); resumable; no DB dump, no deletions; the upload stops after HOURS (default RECONCILE_HOURS)
+#   --alert      used by <NAME>-alert.service after a failed or killed run: heartbeat /fail + optional mail
+set -Eeuo pipefail
+umask 077
+export LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root
+unset MYSQL_PWD MYSQL_HOST MYSQL_TCP_PORT MYSQL_UNIX_PORT PGPASSWORD   # a "sudo -E" run must not log in as another user
+
+NAME=$(basename -- "$0")
+[[ $NAME =~ ^[a-z0-9][a-z0-9-]{1,40}$ ]] || NAME=moodle-backup
+VERSION="msc-backup-1.1"
+MANIFEST_MARK="moodle-backup-manifest"         # first line of every manifest (never change: checks rely on it)
+
+# ---------------------------------------------------------------- settings
+# Override in /etc/default/$NAME (root 0600; written by render-install.sh). No secrets belong in this script.
+BACKEND=""                                     # REQUIRED: onedrive (SharePoint library) | s3 (R2 or S3-compatible)
+REMOTE="${NAME}-crypt:"                        # rclone crypt remote (written by the owner setup script)
+RCLONE_CONF=/var/lib/$NAME/rclone/rclone.conf  # dir root 0700: rclone rewrites the file (rolling Microsoft token)
+RETENTION_BIN=/usr/local/sbin/$NAME-retention
+SET_PREFIX=moodle                              # object names <SET_PREFIX>-{db,users,config,manifest}-<run>.*
+MOODLE=""                                      # REQUIRED: code root (directory with config.php)
+DATAROOT=""                                    # REQUIRED: $CFG->dataroot
+DBTYPE=""                                      # mariadb | mysqli (empty: read from config.php); pgsql: not supported
+DBNAME=""                                      # empty: read from config.php
+DBPREFIX=""                                    # empty: read from config.php (usually mdl_)
+DB_DEFAULTS_FILE=""                            # optional root-only option file (owner) when root has no socket login
+DB_CLIENT=""                                   # empty: mariadb if installed, else mysql
+DB_DUMP_TOOL=""                                # empty: mariadb-dump if installed, else mysqldump
+WEBUSER=www-data                               # owner of the Moodle tree (git runs as the .git owner anyway)
+STAGE=/var/backups/$NAME                       # local staging (0700): last LOCAL_KEEP_SETS sets + filedir state
+STATE=/var/lib/$NAME                           # status + last-run.log readable without sudo (no secrets in them)
+LOCAL_KEEP_SETS=2
+MIN_FREE_GB=15                                 # refuse to start with less free space on $STAGE
+WEEKLY_DOW=5                                   # date +%u (1 = Monday ... 7 = Sunday): weekly copy + code snapshot day
+WEEKLY_MAX_HOURS=180                           # make a weekly copy anyway when the newest one is older (7.5 days)
+HARD_STOP=03:40                                # a run started before this time of day starts no step after it
+RUN_BUDGET_MIN=65                              # and none later than this many minutes after its start
+MIN_START_MIN=25                               # a night run with less time than this before the deadline does not start
+RECONCILE_HOURS=6
+TPSLIMIT=""                                    # requests/s (empty: 8 for onedrive, 0 = unlimited for s3). rclone 1.60
+                                               # honours Retry-After on HTTP 429 only; 503 is retried with backoff
+TRANSFERS=4
+CHECKERS=""                                    # empty: 4 for onedrive, 8 for s3
+CHUNK=""                                       # onedrive upload fragment, multiple of 320 KiB (empty: 20M)
+BWLIMIT=25M                                    # MiB/s upload cap (0 = none)
+SLICES=""                                      # filedir full-sync slices per night: 16 or 1 (empty: 16 onedrive, 1 s3)
+USER_AGENT=""                                  # empty: NONISV|<UA_ORG>|moodle-backup/<version> (Microsoft asks for it)
+UA_ORG="MoodleServerCare"
+MAX_DELETE=1000                                # filedir: more removals than this in one night = stop and ask; also the
+                                               # most mirror files --reconcile accepts as missing locally
+MIN_SHRINK_PCT=70                              # dump smaller than this % of the last good one = stop and ask
+NEW_BATCH=1000                                 # new filedir files are uploaded in batches; progress is kept
+RETENTION_MODE=""                              # apply | check (empty: apply for onedrive, check for s3 with lifecycle)
+CHECK_TOKEN_SAVE=""                            # warn when rclone did not write a refreshed token back (empty: on for onedrive)
+FORCE_SLICE=""                                 # one hex digit: sync that slice tonight instead of the day's one
+HC_URL=""                                      # REQUIRED for real runs: healthchecks.io ping URL (the owner pastes it)
+MAIL_TO=""                                     # optional failure mail through the local MTA (sendmail interface) ...
+MAIL_FROM=""                                   # ... needs a sender the relay accepts, or the mail is rejected
+MOODLEDATA_EXCLUDES=(filedir cache localcache temp sessions trashdir lock)
+SQLITE_DBS=()                                  # other apps' SQLite files, e.g. (appname=/var/www/app/database/db.sqlite)
+CONFIG_PATHS=()                                # files/dirs for the config bundle (render-install.sh lists the existing ones)
+CONFIG_EXCLUDES=('etc/exim4/passwd.client*' 'etc/postfix/sasl_passwd*')   # MTA credentials + every .bak/.dpkg copy
+EXTRA_PATHS=()                                 # more paths for the bundle (owner decision)
+DEFAULTS=/etc/default/$NAME
+if [ -r "$DEFAULTS" ]; then . "$DEFAULTS"; fi
+
+# backend-dependent defaults (only where the defaults file left them empty)
+case "$BACKEND" in
+  onedrive) : "${TPSLIMIT:=8}" "${CHECKERS:=4}" "${CHUNK:=20M}" "${SLICES:=16}" "${RETENTION_MODE:=apply}" "${CHECK_TOKEN_SAVE:=1}" ;;
+  s3)       : "${TPSLIMIT:=0}" "${CHECKERS:=8}" "${CHUNK:=20M}" "${SLICES:=1}"  "${RETENTION_MODE:=check}" "${CHECK_TOKEN_SAVE:=0}" ;;
+esac
+: "${USER_AGENT:=NONISV|$UA_ORG|moodle-backup/$VERSION}"
+
+# ---------------------------------------------------------------- modes
+MODE=run
+DRY=0
+RECON_H=$RECONCILE_HOURS
+case "${1:-}" in
+  "") ;;
+  --dry-run) DRY=1 ;;
+  --preflight) MODE=preflight ;;
+  --reconcile) MODE=reconcile; RECON_H=${2:-$RECONCILE_HOURS} ;;
+  --alert) MODE=alert ;;
+  -h|--help) sed -n '2,/^set -Eeuo/p' "$0" | sed '$d'; exit 0 ;;
+  *) echo "usage: $NAME [--dry-run | --preflight | --reconcile [HOURS] | --alert]" >&2; exit 2 ;;
+esac
+[[ $RECON_H =~ ^[1-9][0-9]?$ ]] || { echo "HOURS must be 1-99" >&2; exit 2; }
+
+# ---------------------------------------------------------------- helpers
+WARNINGS=0
+FAILS=()
+RESULT=fail              # ok | warn | fail | skip; decides the heartbeat in on_exit
+log()  { printf '%(%F %T)T %s\n' -1 "$*"; }
+warn() { log "WARN: $*"; WARNINGS=$((WARNINGS + 1)); }
+die()  { log "ERROR: $*" >&2; exit 1; }   # stderr: inside $(...) the message still reaches the log
+fail_later() { log "ERROR (run continues with the safe steps): $*"; FAILS+=("$*"); }
+
+hc() {  # hc <"" | /start | /fail | /log> [-]   ("-" = request body from stdin)
+  [ -n "$HC_URL" ] || return 0
+  [ "$DRY" = 0 ] || return 0
+  local -a body=()
+  if [ "${2:-}" = - ]; then body=(--data-binary @-); fi
+  # The URL goes to curl as a config file on a pipe (-K), never as an argument: /proc/<pid>/cmdline is readable by
+  # every local user (the web user could otherwise read it and send fake success pings).
+  curl -fsS -m 15 --retry 3 -o /dev/null -K <(printf 'url = "%s%s"\n' "$HC_URL" "${1:-}") "${body[@]}" \
+    || log "WARN: heartbeat ping '${1:-success}' failed"
+}
+
+send_mail() {  # send_mail <subject>   (body from stdin); sendmail through the fixed PATH, never an absolute path
+  [ -n "$MAIL_TO" ] || return 0
+  [ "$DRY" = 0 ] || return 0   # a dry run never mails
+  [ -n "$MAIL_FROM" ] || { log "WARN: MAIL_TO set without MAIL_FROM: no mail sent"; return 0; }
+  # The "completed with warnings" mail is sent from inside the sandboxed unit: the MTA must be able to write its spool
+  # (and exim its log), which <NAME>.service allows with ReadWritePaths=. The message is spooled before sendmail
+  # returns; the MTA's queue runner delivers it if the unit ends first. Failure mails come from the unsandboxed
+  # <NAME>-alert.service.
+  { printf 'From: %s <%s>\nTo: %s\nSubject: [%s] %s\n\n' "$NAME" "$MAIL_FROM" "$MAIL_TO" "$(hostname -s)" "$1"; cat; } \
+    | sendmail -t -oi -f "$MAIL_FROM" || log "WARN: sendmail failed"
+}
+
+if [ "$MODE" = alert ]; then
+  body=$(journalctl -u "$NAME.service" -n 60 --no-pager -o short-iso 2>&1 | tail -c 20000 || true)
+  printf '%s.service failed or was stopped (timeout?). Last journal lines:\n\n%s\n' "$NAME" "$body" | hc /fail -
+  printf 'The nightly off-provider backup failed. Last journal lines:\n\n%s\n' "$body" \
+    | send_mail "nightly backup FAILED $(date '+%F %H:%M')"
+  exit 0
+fi
+
+cfgval() {  # cfgval KEY -> value of a simple single-line $CFG->KEY = '...'; in config.php (never secrets: callers pick)
+  sed -nE "s/^[[:space:]]*\\\$CFG->$1[[:space:]]*=[[:space:]]*['\"]([^'\"]*)['\"].*/\1/p" "$MOODLE/config.php" 2>/dev/null | head -n 1
+}
+stamp_epoch() { date -d "${1:0:8} ${1:9:2}:${1:11:2}" +%s; }   # YYYYMMDD-HHMM -> epoch (local time)
+
+# ---------------------------------------------------------------- settings check (all modes below)
+[ "$(id -u)" = 0 ] || die "must run as root"
+case "$BACKEND" in onedrive|s3) ;; *) die "BACKEND must be onedrive or s3 (set it in $DEFAULTS)";; esac
+[ -n "$MOODLE" ] && [ -f "$MOODLE/config.php" ] || die "MOODLE='$MOODLE' has no config.php (set MOODLE in $DEFAULTS)"
+[ -n "$DATAROOT" ] || DATAROOT=$(cfgval dataroot)
+[ -n "$DATAROOT" ] && [ -d "$DATAROOT" ] || die "DATAROOT='$DATAROOT' is not a directory (set DATAROOT in $DEFAULTS)"
+[ -n "$DBTYPE" ] || DBTYPE=$(cfgval dbtype)
+[ -n "$DBNAME" ] || DBNAME=$(cfgval dbname)
+[ -n "$DBPREFIX" ] || DBPREFIX=$(cfgval prefix)
+case "$DBTYPE" in
+  mariadb|mysqli|auroramysql) ;;
+  pgsql) die "dbtype pgsql: this script dumps MariaDB/MySQL only. Stop and ask (references/design.md, PostgreSQL)" ;;
+  *) die "unsupported or unknown dbtype '$DBTYPE'" ;;
+esac
+[[ $DBNAME =~ ^[A-Za-z0-9_]+$ ]] || die "DBNAME '$DBNAME' is empty or unusual"
+[[ $DBPREFIX =~ ^[A-Za-z0-9_]*$ ]] || die "DBPREFIX '$DBPREFIX' is unusual"
+[[ $SET_PREFIX =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "SET_PREFIX '$SET_PREFIX' must be lowercase letters, digits, dashes"
+case "$SLICES" in 1|16) ;; *) die "SLICES must be 1 or 16";; esac
+[[ $MAX_DELETE =~ ^[0-9]+$ && $MIN_SHRINK_PCT =~ ^[0-9]+$ ]] || die "MAX_DELETE / MIN_SHRINK_PCT must be numbers"
+# LOCAL_KEEP_SETS=0 would make the cleanup delete every local set (head -n -0 prints everything)
+[[ $LOCAL_KEEP_SETS =~ ^[1-9][0-9]?$ ]] || die "LOCAL_KEEP_SETS must be 1-99"
+for d in "$STAGE" "$STATE"; do   # both receive rm -rf of their contents: absolute, normalised, never a top-level dir
+  [[ $d == /* && $d != *//* && $d != */./* && $d != */../* && $d != */. && $d != */.. && $d != */ ]] \
+    || die "STAGE/STATE '$d' must be an absolute, normalised path"
+  [[ $d =~ ^/[^/]+/[^/]+ ]] || die "STAGE/STATE '$d' is too close to / (use e.g. /var/backups/$NAME)"
+  case "$d" in /etc|/etc/*|/usr|/usr/*|/bin|/bin/*|/sbin|/sbin/*|/lib*|/boot|/boot/*|/proc*|/sys*|/dev*|/root|/home|/home/*/) die "STAGE/STATE '$d' is a system directory";; esac
+done
+DBCLI=$DB_CLIENT; DBDUMP=$DB_DUMP_TOOL
+if [ -z "$DBCLI" ]; then if command -v mariadb >/dev/null 2>&1; then DBCLI=mariadb; else DBCLI=mysql; fi; fi
+if [ -z "$DBDUMP" ]; then if command -v mariadb-dump >/dev/null 2>&1; then DBDUMP=mariadb-dump; else DBDUMP=mysqldump; fi; fi
+case "$DBCLI $DBDUMP" in *[!a-z\ -]*) die "DB_CLIENT / DB_DUMP_TOOL must be plain command names";; esac
+DBOPT=()
+if [ -n "$DB_DEFAULTS_FILE" ]; then
+  [ "$(stat -c '%U %a' "$DB_DEFAULTS_FILE" 2>/dev/null)" = "root 600" ] || die "DB_DEFAULTS_FILE must exist, root 0600"
+  DBOPT=(--defaults-file="$DB_DEFAULTS_FILE")   # must be the first option
+fi
+dbq() { "$DBCLI" "${DBOPT[@]}" -N -B "$@"; }
+if [ -f "$MOODLE/public/version.php" ]; then VFILE="$MOODLE/public/version.php"; else VFILE="$MOODLE/version.php"; fi
+
+RL=(--config "$RCLONE_CONF" --user-agent "$USER_AGENT" --tpslimit "$TPSLIMIT")   # light, single calls
+RC=(--config "$RCLONE_CONF" --user-agent "$USER_AGENT" --tpslimit "$TPSLIMIT" --tpslimit-burst 1
+    --transfers "$TRANSFERS" --checkers "$CHECKERS" --bwlimit "$BWLIMIT"
+    --retries 5 --retries-sleep 30s --low-level-retries 20 --use-mmap
+    --stats 10m --stats-one-line --stats-log-level NOTICE)
+if [ "$BACKEND" = onedrive ]; then RC+=(--onedrive-chunk-size "$CHUNK"); else RC+=(--fast-list); fi
+if [ "$DRY" = 1 ]; then RC+=(--dry-run); fi
+
+START=$(date +%s)
+DEADLINE=$(( START + RUN_BUDGET_MIN * 60 ))
+hs_epoch=$(date -d "today $HARD_STOP" +%s)
+if [ "$START" -lt "$hs_epoch" ] && [ "$hs_epoch" -lt "$DEADLINE" ]; then DEADLINE=$hs_epoch; fi
+left() { echo $(( DEADLINE - $(date +%s) )); }
+
+# rcs <step-name> <rclone args...>: rclone with the common flags; output to the journal and to $LOGS/<step>.log.
+# Returns rclone's exit code, or 10 when --max-duration stopped it (rclone 1.60 reports that as fatal, exit 7).
+rcs() {
+  local name=$1 r=0; shift
+  local slog="$LOGS/$name.log"
+  if rclone "$@" "${RC[@]}" 2>&1 | tee "$slog"; then r=0; else r=${PIPESTATUS[0]}; fi
+  if grep -q 'Failed to save config' "$slog"; then TOKEN_SAVE_ERR=1; fi
+  if [ "$r" = 7 ] && grep -q 'max transfer duration reached' "$slog"; then r=10; fi
+  return "$r"
+}
+TOKEN_SAVE_ERR=0
+
+# conf_get <section> <key>: one value from the rclone config without printing anything else (never the secrets).
+conf_get() {
+  awk -v s="[$1]" -v k="$2" '$0 == s {in_s = 1; next} /^\[/ {in_s = 0}
+    in_s && index($0, k " = ") == 1 {print substr($0, length(k) + 4); exit}' "$RCLONE_CONF"
+}
+CRYPT_NAME=${REMOTE%:}
+RAW_REMOTE=""
+[ ! -r "$RCLONE_CONF" ] || RAW_REMOTE=$(conf_get "$CRYPT_NAME" remote)
+
+# auth_hint: provider error codes from the last listing errors, for the log line and the heartbeat body (codes only:
+# AADSTS50173 / invalid_grant = Microsoft token revoked, e.g. after "Revoke sessions"; never any token text).
+auth_hint() {
+  local c
+  c=$(tail -n 20 "$LISTLOG" 2>/dev/null | grep -oE 'AADSTS[0-9]+|invalid_grant|invalid_client|unauthorized_client|interaction_required|consent_required|InvalidAccessKeyId|SignatureDoesNotMatch|AccessDenied' | sort -u | tr '\n' ' ' || true)
+  if [ -n "$c" ]; then printf '; provider says: %s' "${c% }"; fi
+}
+
+# newest <folder> <kind>: newest run stamp of <SET_PREFIX>-<kind>-<stamp>.* in a remote folder ("" if none).
+# Returns 1 (message on stderr) when the folder cannot be listed; the caller decides whether that is fatal.
+newest() {
+  local o r=0
+  o=$(rclone lsf "${RL[@]}" --files-only --include "$SET_PREFIX-$2-*" "${REMOTE}$1/" 2>>"$LISTLOG") || r=$?
+  if [ "$r" != 0 ] && [ "$r" != 3 ]; then
+    log "ERROR: cannot list $1/ on the remote (rclone exit $r$(auth_hint); see $LISTLOG)" >&2; return 1
+  fi
+  sed -nE "s/^$SET_PREFIX-$2-([0-9]{8}-[0-9]{4})\..*\$/\1/p" <<<"$o" | sort | tail -n 1
+}
+
+# check_passphrases: the crypt passphrases must open what is already in the folder. rclone silently skips names it
+# cannot decrypt, so with wrong passphrases the folder looks empty and a run would start a second key domain.
+# Proof, cheapest first: the keycheck object (written by the owner setup script, or by the first run) reads back; or
+# a name in daily/ weekly/ monthly/ code/ decrypts to our naming pattern. password and password2 both feed the one
+# scrypt key that encrypts names and contents, so one decrypted name proves both. A manifest is NOT required: an
+# interrupted first upload (objects, no manifest) must not look like wrong passphrases.
+# Prints one line. Returns 0 = proven or nothing there yet, 1 = objects there but none opens, 2 = listing error.
+KEYCHECK="keycheck/$SET_PREFIX-keycheck.txt"
+KEYCHECK_MARK="moodle-backup keycheck"
+check_passphrases() {
+  local f raw dec r kc n=0 note=""
+  local -a fl=(); [ "$BACKEND" != s3 ] || fl=(--fast-list)
+  for f in keycheck daily weekly monthly code; do
+    r=0; raw=$(rclone lsf "${RL[@]}" --files-only "$RAW_REMOTE/$f/" 2>>"$LISTLOG") || r=$?
+    if [ "$r" != 0 ] && [ "$r" != 3 ]; then
+      echo "cannot list $RAW_REMOTE/$f/ (rclone exit $r$(auth_hint)): token or key expired/revoked? owner: setup script --renew-token or a new key; see $LISTLOG"
+      return 2
+    fi
+    [ -n "$raw" ] || continue
+    n=$(( n + $(wc -l <<<"$raw") ))
+    r=0; dec=$(rclone lsf "${RL[@]}" "${fl[@]}" --files-only "${REMOTE}$f/" 2>>"$LISTLOG") || r=$?
+    if [ "$r" != 0 ] && [ "$r" != 3 ]; then echo "cannot list ${REMOTE}$f/ (rclone exit $r$(auth_hint)); see $LISTLOG"; return 2; fi
+    if [ "$f" = keycheck ]; then
+      # any set prefix proves the passphrases: the setup script may have been run without --set-prefix
+      kc=$(grep -E '^[a-z0-9][a-z0-9-]*-keycheck\.txt$' <<<"$dec" | head -n 1 || true)
+      if [ -n "$kc" ] && rclone cat "${RL[@]}" "${REMOTE}keycheck/$kc" 2>>"$LISTLOG" | grep "^$KEYCHECK_MARK" >/dev/null; then
+        echo "passphrases open the existing backups (keycheck)"; return 0
+      fi
+      continue
+    fi
+    if grep -Eq '^[a-z0-9][a-z0-9-]*-(db|users|config|manifest|code)-[0-9]{8}-[0-9]{4}\.' <<<"$dec"; then
+      grep -Eq "^$SET_PREFIX-(db|users|config|manifest|code)-" <<<"$dec" \
+        || note=", but under another set prefix than SET_PREFIX=$SET_PREFIX: check SET_PREFIX"
+      echo "passphrases open the existing backups (names in $f/ decrypt; no keycheck object yet$note)"; return 0
+    fi
+  done
+  if [ "$n" = 0 ]; then echo "no earlier backups (first run)"; return 0; fi
+  echo "$n object(s) in the folder but none opens with the configured passphrases"; return 1
+}
+
+# ensure_keycheck: after a check that did not use the keycheck object, write it (one small encrypted file; later runs
+# and setups then prove the passphrases with one read, whatever else the folder holds). Never in a dry run.
+ensure_keycheck() {
+  [ "$DRY" = 0 ] || return 0
+  if printf '%s written %s on %s\n' "$KEYCHECK_MARK" "$(date '+%F %T %z')" "$(hostname)" \
+       | rclone rcat "${RL[@]}" "${REMOTE}$KEYCHECK" 2>>"$LISTLOG"; then
+    log "    keycheck object written ($KEYCHECK)"
+  else
+    warn "could not write the keycheck object $KEYCHECK (see $LISTLOG)"
+  fi
+}
+
+# passphrase_gate: the check above, fatal unless proven; writes the keycheck object when it was not there.
+passphrase_gate() {
+  local msg r=0
+  msg=$(check_passphrases) || r=$?
+  case "$r" in
+    0) log "    $msg" ;;
+    2) die "$msg" ;;
+    *) die "$msg: refusing to upload under a second key (wrong passphrases in $RCLONE_CONF?)" ;;
+  esac
+  case "$msg" in *"(keycheck)"*) ;; *) ensure_keycheck ;; esac
+}
+
+# tar into zstd; GNU tar exit 1 ("file changed as we read it") is accepted, 2 is fatal.
+tar_zst() {  # tar_zst <output> <tar args...>
+  local out=$1 t; shift
+  { t=0; tar --warning=no-file-changed -cf - "$@" || t=$?; echo "$t" > "$out.tar_rc"; } | zstd -q -f -T2 -3 -o "$out"
+  t=$(cat "$out.tar_rc"); rm -f "$out.tar_rc"
+  [ "$t" -le 1 ] || die "tar failed (exit $t) for $out"
+  zstd -q -t "$out"
+}
+
+PY_SQLITE='import pathlib, sqlite3, sys
+src = sqlite3.connect(pathlib.Path(sys.argv[1]).as_uri() + "?mode=ro", uri=True, timeout=60)
+dst = sqlite3.connect(sys.argv[2])
+src.backup(dst)
+print(dst.execute("PRAGMA quick_check").fetchone()[0])
+dst.close(); src.close()'
+
+git_desc() {  # git as the owner of .git, never as root on a repo another user can edit; clean env; fd 9 closed
+  [ -d "$MOODLE/.git" ] || { echo "not-a-git-checkout"; return 0; }
+  local u g
+  u=$(stat -c %u "$MOODLE/.git"); g=$(stat -c %g "$MOODLE/.git")
+  if [ "$u" = 0 ]; then
+    env -i PATH=/usr/bin:/bin HOME=/nonexistent GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+      git --no-optional-locks -C "$MOODLE" describe --tags --always 9>&- 2>/dev/null || echo unknown
+  else
+    setpriv --reuid="$u" --regid="$g" --clear-groups -- env -i PATH=/usr/bin:/bin HOME=/nonexistent \
+      GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-optional-locks -C "$MOODLE" describe --tags --always \
+      9>&- 2>/dev/null || echo unknown
+  fi
+}
+
+# ---------------------------------------------------------------- common setup
+mkdir -p "$STAGE/sets" "$STAGE/code" "$STAGE/logs" "$STAGE/filedir-state" "$STATE"
+chmod 700 "$STAGE"; chmod 755 "$STATE"
+LOGS="$STAGE/logs"; FDS="$STAGE/filedir-state"
+LISTLOG="$LOGS/list.log"   # stderr of the light listing calls of this run (emptied at the start of each run)
+if [ "$MODE" = preflight ]; then LISTLOG="$LOGS/preflight.log"; : > "$LISTLOG"; fi
+MODEL="$FDS/remote.list"; COUNTS="$FDS/counts"
+RUNLOG="$STATE/last-run.log"
+
+# ---------------------------------------------------------------- --preflight
+if [ "$MODE" = preflight ]; then
+  bad=0
+  pf() { printf '%-4s %s\n' "$1" "$2"; [ "$1" != FAIL ] || bad=1; }
+  for c in rclone "$DBCLI" "$DBDUMP" zstd tar flock curl python3 setpriv git sendmail; do
+    command -v "$c" >/dev/null && pf OK "tool $c" || pf FAIL "tool $c missing"
+  done
+  pf INFO "$(rclone version | sed -n 1p) (designed and tested on 1.60.1: no ListR and no hard delete for OneDrive)"
+  pf INFO "backend $BACKEND, slices $SLICES, retention $RETENTION_MODE, set prefix $SET_PREFIX"
+  pf INFO "Moodle $MOODLE ($(grep -oP "^\\\$release\s*=\s*'\K[^']*" "$VFILE" 2>/dev/null || echo '?')), dataroot $DATAROOT, db $DBTYPE/$DBNAME prefix '$DBPREFIX'"
+  if [ "$(printf 'SELECT 1;\n' | dbq 2>/dev/null)" = 1 ]; then pf OK "DB reachable ($DBCLI as root${DB_DEFAULTS_FILE:+ with $DB_DEFAULTS_FILE})"
+  else pf FAIL "DB not reachable as root over the socket (set DB_DEFAULTS_FILE, owner writes it)"; fi
+  if [ -f "$RCLONE_CONF" ]; then
+    m=$(stat -c '%U %a' "$RCLONE_CONF"); d=$(stat -c '%U %a' "$(dirname "$RCLONE_CONF")")
+    [ "$m" = "$(id -un) 600" ] && pf OK "config $RCLONE_CONF ($m)" || pf FAIL "config mode is '$m', must be '$(id -un) 600'"
+    [ "$d" = "$(id -un) 700" ] && pf OK "config directory ($d)" || pf FAIL "config directory is '$d', must be '$(id -un) 700'"
+    [ -w "$(dirname "$RCLONE_CONF")" ] && pf OK "config directory writable (refreshed tokens can be saved)" \
+      || pf FAIL "config directory not writable: rclone cannot save a rolling token"
+    raw_name=${RAW_REMOTE%%:*}
+    [ -n "$RAW_REMOTE" ] && pf OK "[$CRYPT_NAME] remote = $RAW_REMOTE" || pf FAIL "[$CRYPT_NAME] missing in $RCLONE_CONF"
+    if [ "$BACKEND" = onedrive ]; then
+      [ "$(conf_get "$raw_name" type)" = onedrive ] && pf OK "[$raw_name] type = onedrive" || pf FAIL "[$raw_name] is not type onedrive"
+      [ "$(conf_get "$raw_name" drive_type)" = documentLibrary ] && pf OK "[$raw_name] drive_type = documentLibrary" \
+        || pf FAIL "[$raw_name] drive_type is not documentLibrary"
+      [ -n "$(conf_get "$raw_name" drive_id)" ] && pf OK "[$raw_name] drive_id set" || pf FAIL "[$raw_name] drive_id missing"
+      [ -n "$(conf_get "$raw_name" token)" ] && pf OK "[$raw_name] token present (not shown)" || pf FAIL "[$raw_name] token missing"
+    else
+      [ "$(conf_get "$raw_name" type)" = s3 ] && pf OK "[$raw_name] type = s3 (provider $(conf_get "$raw_name" provider))" || pf FAIL "[$raw_name] is not type s3"
+      [ -n "$(conf_get "$raw_name" access_key_id)" ] && pf OK "[$raw_name] key present (not shown)" || pf FAIL "[$raw_name] access key missing"
+    fi
+    for kv in filename_encryption=standard directory_name_encryption=false filename_encoding=base32; do
+      [ "$(conf_get "$CRYPT_NAME" "${kv%%=*}")" = "${kv#*=}" ] && pf OK "[$CRYPT_NAME] ${kv/=/ = }" \
+        || pf FAIL "[$CRYPT_NAME] ${kv/=/ = } must be written explicitly"
+    done
+    if [ "$BACKEND" = onedrive ]; then
+      age_h=$(( ($(date +%s) - $(stat -c %Y "$RCLONE_CONF")) / 3600 ))
+      pf INFO "config last rewritten ${age_h} h ago (each run should rewrite it: refreshed token)"
+    fi
+    if rclone lsf "${RL[@]}" --max-depth 1 "$RAW_REMOTE/" >/dev/null 2>>"$LISTLOG"; then
+      pf OK "remote reachable"
+      if msg=$(check_passphrases); then
+        pf OK "$msg"
+        case "$msg" in *"another set prefix"*) pf WARN "objects use another set prefix: SET_PREFIX in $DEFAULTS must match the existing sets" ;;
+                       *"(names in"*) pf INFO "no keycheck object yet: the next real run writes it" ;; esac
+      else pf FAIL "$msg"; fi
+    else
+      pf FAIL "remote not reachable (token expired/revoked or key wrong?$(auth_hint); see $LISTLOG)"
+    fi
+  else
+    pf FAIL "$RCLONE_CONF missing (the owner runs owner-setup-sharepoint.sh or owner-setup-s3.sh)"
+  fi
+  if [ -z "$HC_URL" ]; then
+    pf FAIL "HC_URL not set: required before the timer is enabled (a missed night must alert)"
+  elif [[ ! $HC_URL =~ ^https://[A-Za-z0-9.-]+/[A-Za-z0-9._~/-]+$ ]]; then
+    pf FAIL "HC_URL has an unexpected format (https://hc-ping.com/<uuid>, no quotes or spaces)"
+  elif printf 'preflight from %s at %(%F %T)T\n' "$(hostname)" -1 | curl -fsS -m 15 -o /dev/null \
+         -K <(printf 'url = "%s/log"\n' "$HC_URL") --data-binary @-; then
+    pf OK "HC_URL set; a /log event was sent (check it appears in the healthchecks.io dashboard)"
+  else
+    pf FAIL "HC_URL set but the /log ping failed"
+  fi
+  if [ -n "$MAIL_TO" ] && [ -z "$MAIL_FROM" ]; then pf WARN "MAIL_TO without MAIL_FROM: no mail would be sent"; fi
+  [ -d "$DATAROOT/filedir" ] && [ -n "$(find "$DATAROOT/filedir" -type f -print -quit)" ] \
+    && pf OK "filedir present and not empty" || pf FAIL "filedir missing or empty under $DATAROOT"
+  [ -d "$DATAROOT/secret" ] && pf OK "moodledata/secret present (it goes into every bundle)" || pf INFO "no moodledata/secret (older Moodle?)"
+  [ -s "$MODEL" ] && pf OK "filedir mirror state present ($(wc -l < "$MODEL") files)" \
+    || pf FAIL "no filedir mirror state: run '$NAME --reconcile' once (first seed / new server)"
+  avail_gb=$(( $(df --output=avail -k "$STAGE" | tail -n 1) / 1048576 ))
+  [ "$avail_gb" -ge "$MIN_FREE_GB" ] && pf OK "${avail_gb} GB free on $STAGE" || pf FAIL "only ${avail_gb} GB free on $STAGE"
+  [ "${#CONFIG_PATHS[@]}" -gt 0 ] || pf WARN "CONFIG_PATHS is empty: the bundle would hold only config.php and moodledata"
+  for p in "${CONFIG_PATHS[@]}" "${EXTRA_PATHS[@]}"; do [ -e "$p" ] || pf WARN "bundle path missing: $p"; done
+  for spec in "${SQLITE_DBS[@]}"; do [ -f "${spec#*=}" ] || pf WARN "SQLite file missing: ${spec#*=}"; done
+  pf INFO "timer: $(systemctl is-enabled "$NAME.timer" 2>/dev/null || echo not-installed)"
+  if [ "$bad" = 0 ]; then echo "preflight: no FAIL"; else echo "preflight: FAIL above"; fi
+  exit "$bad"
+fi
+
+# ---------------------------------------------------------------- run / dry-run / reconcile
+exec 9>"$STATE/run.lock"
+if ! flock -n 9; then log "another $NAME run is active: nothing done"; RESULT=skip; exit 0; fi
+
+# All output also goes to $RUNLOG (the heartbeat body). fds 3/4 keep the journal for the end of the run.
+# The tee ignores TERM/INT: at the timeout systemd signals the whole cgroup, and a dead tee would kill this script with
+# SIGPIPE on its next output line, before the TERM trap could remove a partial dump and ping /fail.
+exec 3>&1 4>&2
+: > "$RUNLOG"; chmod 644 "$RUNLOG"
+: > "$LISTLOG"
+exec > >(trap '' TERM INT; exec tee -a "$RUNLOG") 2>&1
+TEE_PID=$!
+jlog() { log "$*" | tee -a "$RUNLOG"; }   # once the tee is closed: to the journal and to $RUNLOG
+
+on_exit() {
+  local rc=$?
+  set +e
+  exec 1>&3 2>&4; wait "$TEE_PID" 2>/dev/null   # the tee has written everything; append directly from here on
+  if [ "$rc" != 0 ]; then jlog "$NAME FAILED (exit $rc)"; fi
+  if [ -n "${DUMP:-}" ] && [ "${DUMP_OK:-0}" != 1 ] && [ -e "$DUMP" ]; then rm -f -- "$DUMP"; jlog "partial dump removed"; fi
+  case "$RESULT" in
+    ok)   tail -n 25 "$RUNLOG" | hc "" - ;;
+    warn|fail)
+      { grep -E 'WARN|ERROR' "$RUNLOG" | head -n 60; echo "-----"; tail -n 40 "$RUNLOG"; } | tail -c 20000 > "$STATE/hc-body.txt"
+      hc /fail - < "$STATE/hc-body.txt"
+      # a failed run also starts the alert unit (OnFailure=), which mails; a run with warnings exits 0, so mail here
+      if [ "$RESULT" = warn ]; then send_mail "nightly backup OK with $WARNINGS warning(s)" < "$STATE/hc-body.txt"; fi
+      rm -f "$STATE/hc-body.txt" ;;
+  esac
+}
+trap on_exit EXIT
+trap 'log "ERROR: exit $? at line $LINENO: $BASH_COMMAND"' ERR
+trap 'log "terminated by signal (timeout or stop)"; exit 143' TERM INT
+
+for c in rclone "$DBCLI" "$DBDUMP" zstd tar flock curl python3 setpriv find sort comm split; do
+  command -v "$c" >/dev/null || die "missing $c"
+done
+[ -r "$RCLONE_CONF" ] || die "missing $RCLONE_CONF (the owner runs the setup script first)"
+[ -w "$(dirname "$RCLONE_CONF")" ] || die "$(dirname "$RCLONE_CONF") not writable: rclone could not save a rolling token"
+rclone listremotes --config "$RCLONE_CONF" | grep -x -- "$REMOTE" >/dev/null || die "remote $REMOTE not defined in $RCLONE_CONF"
+[ -n "$RAW_REMOTE" ] || die "[$CRYPT_NAME] has no 'remote =' line"
+[ "$(conf_get "$CRYPT_NAME" filename_encoding)" = base32 ] || die "crypt filename_encoding must be base32 (case-insensitive SharePoint; written explicitly everywhere)"
+[ "$(conf_get "$CRYPT_NAME" directory_name_encryption)" = false ] || die "crypt directory_name_encryption must be false (folder prefixes for retention/lifecycle)"
+[ -z "$HC_URL" ] || [[ $HC_URL =~ ^https://[A-Za-z0-9.-]+/[A-Za-z0-9._~/-]+$ ]] || die "HC_URL has an unexpected format"
+[ -d "$DATAROOT/filedir" ] || die "no filedir under $DATAROOT (mount problem?)"
+[ -n "$(find "$DATAROOT/filedir" -type f -print -quit)" ] || die "filedir is empty (mount problem?)"
+avail_gb=$(( $(df --output=avail -k "$STAGE" | tail -n 1) / 1048576 ))
+[ "$avail_gb" -ge "$MIN_FREE_GB" ] || die "only ${avail_gb} GB free on $STAGE (need $MIN_FREE_GB)"
+
+count_slices() {  # count_slices <list> -> "total N" + one "<first char> N" line per first character
+  awk '{n[substr($0,1,1)]++; t++} END {printf "total %d\n", t; for (k in n) printf "%s %d\n", k, n[k]}' "$1"
+}
+
+# ---------------------------------------------------------------- --reconcile (seed)
+# The model of the remote becomes local + mirror (not local alone): mirror files that are missing locally (a filedir
+# copied only in part, e.g. during a server move) stay visible to the night guards, which compare against the model.
+# More of them than MAX_DELETE = stop: otherwise the slice syncs would move them to filedir-deleted/ without an alert.
+if [ "$MODE" = reconcile ]; then
+  RESULT=skip   # not a night backup: no heartbeat either way
+  log "$NAME $VERSION reconcile: one listing of the whole mirror (slow on SharePoint: one request per folder), then the missing files (upload max ${RECON_H} h)"
+  passphrase_gate
+  find "$DATAROOT/filedir" -type f -printf '%P\n' | sort > "$FDS/local.list"
+  log "    $(wc -l < "$FDS/local.list") local files; listing the mirror"
+  fl=(); [ "$BACKEND" != s3 ] || fl=(--fast-list)
+  r=0; rclone lsf -R --files-only "${RL[@]}" "${fl[@]}" --checkers "$CHECKERS" "${REMOTE}filedir" > "$FDS/mirror.raw" 2>"$LOGS/reconcile-list.log" || r=$?
+  case "$r" in
+    0) ;;
+    3) : > "$FDS/mirror.raw" ;;   # no filedir/ yet: first seed
+    *) die "listing the mirror failed (rclone exit $r, see $LOGS/reconcile-list.log)" ;;
+  esac
+  sort -u "$FDS/mirror.raw" > "$FDS/mirror.list"; rm -f "$FDS/mirror.raw"
+  comm -23 "$FDS/local.list" "$FDS/mirror.list" > "$FDS/missing.list"   # local, not in the mirror: upload
+  comm -13 "$FDS/local.list" "$FDS/mirror.list" > "$FDS/extra.list"     # in the mirror, not local
+  n_missing=$(wc -l < "$FDS/missing.list"); n_extra=$(wc -l < "$FDS/extra.list")
+  log "    mirror: $(wc -l < "$FDS/mirror.list") files; $n_missing to upload; $n_extra in the mirror but not in the local filedir"
+  if [ "$n_extra" -gt "$MAX_DELETE" ]; then
+    die "$n_extra mirror files are missing from the local filedir (> MAX_DELETE=$MAX_DELETE): finish copying filedir first (server move?), then run --reconcile again; only if they were really deleted, run once with MAX_DELETE raised (list: $FDS/extra.list)"
+  fi
+  if [ "$n_extra" -gt 0 ]; then
+    warn "$n_extra mirror file(s) are not in the local filedir: they stay in the model, so the slice syncs move them to filedir-deleted/ over the next nights (list: $FDS/extra.list)"
+  fi
+  if [ "$n_missing" -gt 0 ]; then
+    r=0; rcs reconcile copy "$DATAROOT/filedir" "${REMOTE}filedir" --files-from-raw "$FDS/missing.list" --no-traverse \
+           --size-only --max-duration "${RECON_H}h" || r=$?
+    case "$r" in
+      0)  ;;
+      10) die "time limit reached: run --reconcile again, it continues where it stopped" ;;
+      *)  die "reconcile failed (rclone exit $r, see $LOGS/reconcile.log)" ;;
+    esac
+  fi
+  sort -m -u "$FDS/local.list" "$FDS/mirror.list" > "$MODEL.tmp" && mv -f "$MODEL.tmp" "$MODEL"
+  count_slices "$FDS/local.list" > "$COUNTS"
+  rm -f "$FDS/local.list" "$FDS/missing.list" "$FDS/mirror.list"
+  log "reconcile complete: the filedir mirror state is rebuilt ($(wc -l < "$MODEL") files in the model)"
+  exit 0
+fi
+
+# ---------------------------------------------------------------- night run
+if [ "$DRY" = 0 ] && [ -z "$HC_URL" ]; then die "HC_URL not set in $DEFAULTS: a real run needs the heartbeat"; fi
+[ "$DRY" = 0 ] || [ -n "$HC_URL" ] || warn "HC_URL not set (dry run continues; a real run would stop here)"
+[ "$(left)" -ge $(( MIN_START_MIN * 60 )) ] || die "only $(( $(left) / 60 )) min before the deadline: too late to start a night run"
+passphrase_gate
+
+TS=$(date +%Y%m%d-%H%M); DOW=$(date +%u)
+SET="$STAGE/sets/$TS"
+[ ! -e "$SET" ] || die "set $TS already exists (two runs in one minute?)"
+mkdir -p "$SET"
+log "$NAME $VERSION start run=$TS backend=$BACKEND dry_run=$DRY free=${avail_gb}GB deadline=$(date -d "@$DEADLINE" +%H:%M)"
+hc /start
+
+# ---------------------------------------------------------------- 1. database
+DUMP="$SET/$SET_PREFIX-db-$TS.sql.zst"
+expected=$(dbq -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$DBNAME' AND table_type='BASE TABLE'") \
+  || die "cannot query the DB as root (set DB_DEFAULTS_FILE?)"
+[ "$expected" -gt 0 ] || die "database $DBNAME has no tables"
+log "1/8 dump $DBNAME ($expected tables, $DBDUMP)"
+t0=$SECONDS
+# No --databases: the dump has no CREATE DATABASE / USE, so a restore always names its target DB explicitly and can
+# never overwrite production by accident. --single-transaction: consistent InnoDB snapshot without table locks.
+if "$DBDUMP" "${DBOPT[@]}" --single-transaction --quick --hex-blob --routines --events --triggers \
+     --default-character-set=utf8mb4 --max-allowed-packet=1G "$DBNAME" | zstd -q -f -T2 -3 -o "$DUMP"; then :; else
+  st=("${PIPESTATUS[@]}"); die "dump failed ($DBDUMP exit ${st[0]}, zstd exit ${st[1]})"
+fi
+zstd -q -t "$DUMP"
+last=$(zstdcat "$DUMP" | tail -n 1)
+[[ $last == "-- Dump completed"* ]] || die "dump has no completion trailer"
+got=$(zstdcat "$DUMP" | grep -c '^CREATE TABLE ' || true)
+[ "${got:-0}" = "$expected" ] || die "dump has ${got:-0} CREATE TABLE statements, expected $expected"
+dump_bytes=$(stat -c %s "$DUMP")
+DUMP_OK=1
+# Shrink guard against the last SUCCESSFUL run (status file), never against a failed or dry-run leftover.
+old=$(sed -nE 's/^dump_bytes=([0-9]+).*/\1/p' "$STATE/status" 2>/dev/null || true)
+shrunk=0
+if [ -n "$old" ] && [ $(( dump_bytes * 100 )) -lt $(( old * MIN_SHRINK_PCT )) ]; then
+  shrunk=1
+  fail_later "dump shrank below ${MIN_SHRINK_PCT}% of the last good run ($old -> $dump_bytes bytes): uploaded to daily/ only, weekly/monthly and filedir removals skipped; after checking, run once with MIN_SHRINK_PCT=0"
+fi
+if "$DBDUMP" --help 2>/dev/null | grep -q -- '--system'; then
+  if ! "$DBDUMP" "${DBOPT[@]}" --system=users | zstd -q -f -o "$SET/$SET_PREFIX-users-$TS.sql.zst"; then
+    warn "DB accounts dump failed (not fatal: Moodle needs only its own DB user)"; rm -f "$SET/$SET_PREFIX-users-$TS.sql.zst"
+  fi
+else
+  log "    (no --system=users in $DBDUMP: DB accounts not dumped; recreate the Moodle DB user from config.php on restore)"
+fi
+log "    dump ok: ${dump_bytes} bytes in $(( SECONDS - t0 )) s"
+
+# ---------------------------------------------------------------- 2. SQLite of other apps (optional)
+sqlite_info=""
+if [ "${#SQLITE_DBS[@]}" -gt 0 ]; then
+  log "2/8 SQLite copies"
+  mkdir -p "$SET/sqlite"
+  for spec in "${SQLITE_DBS[@]}"; do
+    name=${spec%%=*}; path=${spec#*=}
+    [[ $name =~ ^[A-Za-z0-9_-]+$ ]] || { warn "SQLite entry '$spec' has an unusual name, skipped"; continue; }
+    if [ ! -f "$path" ]; then warn "SQLite $name: $path missing"; continue; fi
+    if res=$(python3 -I -c "$PY_SQLITE" "$path" "$SET/sqlite/$name.sqlite" 2>&1) && [ "$res" = ok ]; then
+      sqlite_info+=" $name=$(stat -c %s "$SET/sqlite/$name.sqlite"):ok"
+    else
+      warn "SQLite $name: online backup failed (${res:0:200}); plain copy taken instead"
+      cp -p -- "$path" "$SET/sqlite/$name.sqlite"; sqlite_info+=" $name=copy"
+    fi
+  done
+else
+  log "2/8 SQLite: none configured"
+fi
+
+# ---------------------------------------------------------------- 3. config bundle
+log "3/8 config bundle"
+read -r fd_files fd_bytes < <(find "$DATAROOT/filedir" -type f -printf '%s\n' | awk '{n++; s+=$1} END {print n+0, s+0}')
+moodle_head=$(head -c 64 "$MOODLE/.git/HEAD" 2>/dev/null | tr -cd '0-9a-f' || true)
+{
+  echo "$MANIFEST_MARK $VERSION"
+  echo "run=$TS host=$(hostname) dry_run=$DRY backend=$BACKEND"
+  echo "moodle_release=$(grep -oP "^\\\$release\s*=\s*'\K[^']*" "$VFILE" || echo unknown)"
+  echo "moodle_git=$(git_desc) moodle_git_head=${moodle_head:-unknown}"
+  echo "db_server=$(dbq -e 'SELECT VERSION()' 2>/dev/null || echo unknown) dump_tool=$DBDUMP"
+  echo "db=$DBNAME prefix=$DBPREFIX tables=$expected dump_bytes=$dump_bytes dump_sha256=$(sha256sum "$DUMP" | cut -d' ' -f1)"
+  # Row counts only (no personal data), taken just after the dump: restore drills compare against them.
+  echo "rows_after_dump=$(dbq "$DBNAME" -e "SELECT CONCAT('users=',(SELECT COUNT(*) FROM ${DBPREFIX}user),' courses=',(SELECT COUNT(*) FROM ${DBPREFIX}course),' files=',(SELECT COUNT(*) FROM ${DBPREFIX}files))" 2>/dev/null || echo unknown)"
+  echo "filedir_files=$fd_files filedir_bytes=$fd_bytes"
+  echo "sqlite:${sqlite_info:- none}"
+  echo "rclone=$(rclone version | sed -n 1p) remote=$RAW_REMOTE"
+} > "$SET/$SET_PREFIX-manifest-$TS.txt"
+dpkg-query -W -f='${Package} ${Version}\n' > "$SET/packages.txt" 2>/dev/null || true
+apt-mark showmanual > "$SET/apt-manual.txt" 2>/dev/null || true
+paths=()
+for p in "$MOODLE/config.php" "${CONFIG_PATHS[@]}" "${EXTRA_PATHS[@]}" "$DATAROOT"; do
+  if [ -e "$p" ]; then paths+=("${p#/}"); else warn "config path missing, skipped: $p"; fi
+done
+excl=()
+for e in "${CONFIG_EXCLUDES[@]}"; do excl+=("--exclude=${e#/}"); done
+for e in "${MOODLEDATA_EXCLUDES[@]}"; do excl+=("--exclude=${DATAROOT#/}/$e"); done
+extra_members=(packages.txt apt-manual.txt)
+[ ! -d "$SET/sqlite" ] || extra_members+=(sqlite)
+# Exclusions must come before the member names (GNU tar options are positional).
+tar_zst "$SET/$SET_PREFIX-config-$TS.tar.zst" "${excl[@]}" -C / "${paths[@]}" \
+  -C "$SET" "$SET_PREFIX-manifest-$TS.txt" "${extra_members[@]}"
+rm -rf "$SET/packages.txt" "$SET/apt-manual.txt" "$SET/sqlite"
+listing=$(zstdcat "$SET/$SET_PREFIX-config-$TS.tar.zst" | tar -tf -)
+if [ -d "$DATAROOT/secret" ]; then
+  grep -q "^${DATAROOT#/}/secret/." <<<"$listing" \
+    || die "config bundle lacks moodledata/secret (encrypted Moodle settings could not be restored)"
+fi
+if grep -Eq '(^|/)(passwd\.client[^/]*|sasl_passwd[^/]*|rclone\.conf[^/]*)$' <<<"$listing"; then
+  die "config bundle contains a credential file (MTA passwd.client*/sasl_passwd* or rclone.conf): fix CONFIG_EXCLUDES"
+fi
+unset listing
+log "    bundle ok: $(stat -c %s "$SET/$SET_PREFIX-config-$TS.tar.zst") bytes"
+
+# ---------------------------------------------------------------- 4. upload the set
+# Manifest last: retention counts a set only when db + config + manifest are all there (commit marker).
+up_set() {  # up_set <folder>: returns non-zero on failure; the caller decides whether that is fatal
+  rcs "up-$1" copy "$SET" "${REMOTE}$1/" --filter "- $SET_PREFIX-manifest-*" --filter "+ $SET_PREFIX-*-$TS.*" --filter "- *" \
+    || return 1
+  rcs "up-$1-manifest" copyto "$SET/$SET_PREFIX-manifest-$TS.txt" "${REMOTE}$1/$SET_PREFIX-manifest-$TS.txt" || return 1
+}
+log "4/8 upload set $TS"
+up_set daily || die "upload of set $TS to daily/ failed (see $LOGS/up-daily.log, $LOGS/up-daily-manifest.log)"
+# weekly/ and monthly/ are decided only now: a listing error can no longer cost the daily set, and it is not fatal
+weekly_due=0; monthly_due=0
+if ! lw=$(newest weekly manifest); then fail_later "cannot list weekly/: no weekly copy tonight"; lw=SKIP; fi
+if ! lm=$(newest monthly manifest); then fail_later "cannot list monthly/: no monthly copy tonight"; lm=SKIP; fi
+if [ "$lw" = SKIP ]; then :
+elif [ -z "$lw" ]; then weekly_due=1
+else
+  lw_h=$(( ($(date +%s) - $(stamp_epoch "$lw")) / 3600 ))
+  if { [ "$DOW" = "$WEEKLY_DOW" ] && [ "$lw_h" -ge 48 ]; } || [ "$lw_h" -ge "$WEEKLY_MAX_HOURS" ]; then weekly_due=1; fi
+fi
+if [ "$lm" != SKIP ] && [ "${lm:0:6}" != "${TS:0:6}" ]; then monthly_due=1; fi
+if [ "$shrunk" = 1 ]; then weekly_due=0; monthly_due=0; fi
+# Each extra copy uploads the whole set again; none starts with less than 15 min left (the age rules make it later).
+if [ "$weekly_due" = 1 ] && [ "$(left)" -lt 900 ]; then warn "weekly copy due but less than 15 min left: skipped tonight"; weekly_due=0; fi
+if [ "$weekly_due" = 1 ]; then
+  log "    + weekly/"; up_set weekly || { fail_later "upload of set $TS to weekly/ failed (see $LOGS/up-weekly*.log)"; weekly_due=0; }
+fi
+if [ "$monthly_due" = 1 ] && [ "$(left)" -lt 900 ]; then warn "monthly copy due but less than 15 min left: skipped tonight"; monthly_due=0; fi
+if [ "$monthly_due" = 1 ]; then
+  log "    + monthly/"; up_set monthly || { fail_later "upload of set $TS to monthly/ failed (see $LOGS/up-monthly*.log)"; monthly_due=0; }
+fi
+
+# ---------------------------------------------------------------- 5. code
+code_due=0
+if ! lc=$(newest code code); then fail_later "cannot list code/: no code snapshot tonight"; lc=SKIP; fi
+if [ "$lc" = SKIP ]; then :
+elif [ -z "$lc" ] || [ ! -e "$STATE/code.stamp" ] || [ "$weekly_due" = 1 ]; then code_due=1
+elif [ $(( ($(date +%s) - $(stamp_epoch "$lc")) / 3600 )) -ge "$WEEKLY_MAX_HOURS" ]; then code_due=1
+elif [ -n "$(find "$MOODLE" -path "$MOODLE/.git" -prune -o -cnewer "$STATE/code.stamp" -print -quit)" ]; then code_due=1
+fi
+if [ "$code_due" = 1 ] && [ "$(left)" -lt 900 ]; then warn "code snapshot due but less than 15 min left: skipped"; code_due=0; fi
+if [ "$code_due" = 1 ]; then
+  log "5/8 code tree (without .git)"
+  code_t0=$(date +%s)
+  CODE="$STAGE/code/$SET_PREFIX-code-$TS.tar.zst"
+  tar_zst "$CODE" "--exclude=${MOODLE#/}/.git" -C / "${MOODLE#/}"
+  if rcs up-code copy "$STAGE/code" "${REMOTE}code/" --filter "+ $SET_PREFIX-code-$TS.tar.zst" --filter "- *"; then
+    if [ "$DRY" = 0 ]; then touch -d "@$code_t0" "$STATE/code.stamp"; fi
+  else
+    fail_later "upload of the code snapshot failed (see $LOGS/up-code.log)"; code_due=0
+  fi
+  find "$STAGE/code" -maxdepth 1 -name "$SET_PREFIX-code-*.tar.zst" | sort | head -n -1 | xargs -r rm -f --
+else
+  log "5/8 code: unchanged and not due"
+fi
+
+# ---------------------------------------------------------------- 6. filedir mirror
+log "6/8 filedir mirror ($fd_files files, $fd_bytes bytes)"
+CUR="$FDS/local.list"
+find "$DATAROOT/filedir" -type f -printf '%P\n' | sort > "$CUR"
+fd_listed=$(wc -l < "$CUR")
+prev_total=$(sed -nE 's/^total ([0-9]+)$/\1/p' "$COUNTS" 2>/dev/null || true)
+fd_new=0; slice=""; slice_moved=0; slice_reup=0; filedir_ok=1
+if [ ! -s "$MODEL" ]; then
+  filedir_ok=0
+  fail_later "no filedir mirror state: new files were NOT uploaded; run '$NAME --reconcile' once (references/install.md)"
+else
+  # 6a. new files (cheap: one existence check + upload per new file, no listing)
+  comm -23 "$CUR" "$MODEL" > "$FDS/new.list"
+  fd_new=$(wc -l < "$FDS/new.list")
+  log "    6a. $fd_new new file(s) since the last upload"
+  rm -f "$FDS"/batch.*
+  if [ "$fd_new" -gt 0 ]; then
+    split -l "$NEW_BATCH" -d -a 4 "$FDS/new.list" "$FDS/batch."
+    for b in "$FDS"/batch.*; do
+      if [ "$(left)" -lt 300 ]; then warn "time limit: some new files wait for the next night"; filedir_ok=0; break; fi
+      r=0; rcs new copy "$DATAROOT/filedir" "${REMOTE}filedir" --files-from-raw "$b" --no-traverse --size-only -v \
+             --max-duration "$(( $(left) - 240 ))s" || r=$?
+      if [ "$r" = 0 ]; then
+        if [ "$DRY" = 0 ]; then sort -m -u "$MODEL" "$b" > "$MODEL.tmp" && mv -f "$MODEL.tmp" "$MODEL"; fi
+      elif [ "$r" = 10 ]; then warn "time limit during the upload of new files: the rest waits for the next night"; filedir_ok=0; break
+      else fail_later "upload of new filedir files failed (rclone exit $r, see $LOGS/new.log)"; filedir_ok=0; break
+      fi
+    done
+    rm -f "$FDS"/batch.*
+  fi
+  # 6b. full sync of one slice (SLICES=16) or of the whole tree (SLICES=1): removals -> filedir-deleted/<run>/
+  if [ "$SLICES" = 16 ]; then
+    hex=0123456789abcdef
+    slice=${FORCE_SLICE:-${hex:$(( ($(date +%s) / 86400) % 16 )):1}}
+    [[ $slice =~ ^[0-9a-f]$ ]] || die "FORCE_SLICE must be one hex digit"
+    pat="^$slice"; incl="/$slice?/**"
+    prev_slice=$(sed -nE "s/^$slice ([0-9]+)\$/\1/p" "$COUNTS" 2>/dev/null || true)
+  else
+    slice=all; pat='^[0-9a-f][0-9a-f]/'; incl="/[0-9a-f][0-9a-f]/**"; prev_slice=""   # the total guard covers it
+  fi
+  grep -E "$pat" "$CUR" > "$FDS/cur.slice" || true
+  grep -E "$pat" "$MODEL" > "$FDS/model.slice" || true
+  exp_del=$(comm -23 "$FDS/model.slice" "$FDS/cur.slice" | wc -l)
+  exp_new=$(comm -13 "$FDS/model.slice" "$FDS/cur.slice" | wc -l)
+  cur_slice=$(wc -l < "$FDS/cur.slice")
+  if [ "$shrunk" = 1 ]; then
+    log "    6b. slice $slice skipped (dump shrank, see above)"; filedir_ok=0
+  elif [ -n "$prev_total" ] && [ "$fd_listed" -lt $(( prev_total - MAX_DELETE )) ]; then
+    fail_later "filedir has $fd_listed files, last good run $prev_total (> $MAX_DELETE fewer): slice sync skipped, mirror untouched; if the removal is real, run once with MAX_DELETE raised"
+    filedir_ok=0
+  elif [ -n "$prev_slice" ] && [ "$cur_slice" -lt $(( prev_slice - MAX_DELETE )) ]; then
+    fail_later "slice $slice has $cur_slice files, last good run $prev_slice: slice sync skipped, mirror untouched"
+    filedir_ok=0
+  elif [ "$exp_del" -gt "$MAX_DELETE" ]; then
+    fail_later "slice $slice would move $exp_del files to filedir-deleted (> $MAX_DELETE): skipped, mirror untouched; if real, run once with MAX_DELETE raised"
+    filedir_ok=0
+  elif [ "$(left)" -lt 600 ]; then
+    warn "less than 10 min left: slice $slice not synced tonight"; filedir_ok=0
+  else
+    log "    6b. slice $slice: $cur_slice local files, $exp_del to move to filedir-deleted/$TS (expected)"
+    r=0; rcs "slice-$slice" sync "$DATAROOT/filedir" "${REMOTE}filedir" --include "$incl" --size-only -v \
+           --max-delete "$MAX_DELETE" --backup-dir "${REMOTE}filedir-deleted/$TS" --max-duration "$(( $(left) - 240 ))s" || r=$?
+    slice_moved=$(grep -c ': Moved into backup dir$' "$LOGS/slice-$slice.log" || true)
+    copied=$(grep -c ': Copied (new)$' "$LOGS/slice-$slice.log" || true)
+    if [ "$r" = 0 ]; then
+      if [ "$DRY" = 0 ]; then
+        { grep -Ev "$pat" "$MODEL" || true; cat "$FDS/cur.slice"; } | sort > "$MODEL.tmp" && mv -f "$MODEL.tmp" "$MODEL"
+      fi
+      slice_reup=$(( copied > exp_new ? copied - exp_new : 0 ))
+      log "    slice $slice done: $slice_moved moved to filedir-deleted/$TS, $copied uploaded"
+      if [ "$slice_reup" -gt 0 ]; then
+        warn "slice $slice: $slice_reup file(s) were missing on the remote and were uploaded again (deleted there by someone or something?)"
+      fi
+    elif [ "$r" = 10 ]; then warn "time limit during slice $slice (it is synced again at its next turn)"; filedir_ok=0
+    elif grep -q 'max-delete threshold reached' "$LOGS/slice-$slice.log"; then
+      fail_later "slice $slice: more than $MAX_DELETE removals on the remote side, stopped after $slice_moved; check before raising MAX_DELETE"; filedir_ok=0
+    else fail_later "slice $slice sync failed (rclone exit $r, see $LOGS/slice-$slice.log)"; filedir_ok=0
+    fi
+  fi
+  if [ "$filedir_ok" = 1 ] && [ "$DRY" = 0 ]; then count_slices "$CUR" > "$COUNTS"; fi
+fi
+
+# ---------------------------------------------------------------- 7. retention
+# Report only in a dry run, and while the dump is flagged as shrunk: the dailies from before the shrink must not age
+# out while nobody has checked it.
+if [ "$RETENTION_MODE" = apply ] && [ "$DRY" = 0 ] && [ "$shrunk" = 0 ]; then rargs=(--apply)
+elif [ "$RETENTION_MODE" = check ]; then rargs=(--check --lifecycle)
+else rargs=(--check); fi
+if [ ! -x "$RETENTION_BIN" ]; then warn "$RETENTION_BIN not installed"
+elif [ "$(left)" -lt 180 ]; then warn "less than 3 min left: retention not run tonight"
+else
+  log "7/8 retention (${rargs[*]})"
+  if ! "$RETENTION_BIN" "${rargs[@]}"; then warn "retention reported problems (see lines above)"; fi
+fi
+
+# ---------------------------------------------------------------- 8. token write-back, local cleanup, status
+log "8/8 checks and status"
+if [ "$CHECK_TOKEN_SAVE" = 1 ]; then
+  conf_age=$(( $(date +%s) - $(stat -c %Y "$RCLONE_CONF") ))
+  if [ "$TOKEN_SAVE_ERR" = 1 ] || [ "$conf_age" -gt 10800 ]; then
+    warn "rclone did not save a refreshed Microsoft token (config unchanged for $(( conf_age / 3600 )) h): the token will expire; check that $(dirname "$RCLONE_CONF") is writable"
+  fi
+fi
+if [ "$DRY" = 1 ]; then
+  rm -rf -- "$SET"   # a dry run never removes real sets
+else
+  # Keep the newest LOCAL_KEEP_SETS COMPLETE local sets (db + config + manifest). Leftovers of failed nights never
+  # count, so two failed nights cannot push out the last good local set.
+  kept=0
+  while read -r s; do
+    [[ $s =~ ^[0-9]{8}-[0-9]{4}$ ]] || continue
+    if [ -f "$STAGE/sets/$s/$SET_PREFIX-db-$s.sql.zst" ] && [ -f "$STAGE/sets/$s/$SET_PREFIX-config-$s.tar.zst" ] \
+       && [ -f "$STAGE/sets/$s/$SET_PREFIX-manifest-$s.txt" ]; then
+      kept=$((kept + 1)); [ "$kept" -gt "$LOCAL_KEEP_SETS" ] || continue
+    fi
+    rm -rf -- "${STAGE:?}/sets/$s"
+  done < <(find "$STAGE/sets" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -r)
+fi
+if [ "${#FAILS[@]}" -gt 0 ]; then
+  log "$NAME FINISHED WITH ${#FAILS[@]} ERROR(S) run=$TS (the set itself is uploaded):"
+  for f in "${FAILS[@]}"; do log "  - $f"; done
+  exit 1
+fi
+if [ "$DRY" = 0 ]; then
+  {
+    echo "last_ok=$TS"
+    echo "finished=$(date '+%F %T %z')"
+    echo "duration_s=$(( $(date +%s) - START ))"
+    echo "dump_bytes=$dump_bytes tables=$expected"
+    echo "filedir_files=$fd_files filedir_bytes=$fd_bytes filedir_new=$fd_new slice=$slice slice_moved=$slice_moved slice_reuploaded=$slice_reup filedir_ok=$filedir_ok"
+    echo "weekly=$weekly_due monthly=$monthly_due code=$code_due"
+    echo "warnings=$WARNINGS"
+  } > "$STATE/status.tmp"
+  chmod 644 "$STATE/status.tmp"; mv -f "$STATE/status.tmp" "$STATE/status"
+fi
+log "$NAME OK run=$TS duration=$(( $(date +%s) - START ))s dump=${dump_bytes}B warnings=$WARNINGS dry_run=$DRY"
+if [ "$WARNINGS" -gt 0 ]; then RESULT=warn; else RESULT=ok; fi

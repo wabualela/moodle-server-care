@@ -1,0 +1,13 @@
+{
+  "name": "moodle-server-care",
+  "owner": {
+    "name": "Wail Abualela"
+  },
+  "plugins": [
+    {
+      "name": "moodle-server-care",
+      "source": "./",
+      "description": "Modular operations skills for production Moodle servers (audit, monitoring, Cloudflare, mail, nginx, tuning, hygiene, backup, maintenance)."
+    }
+  ]
+}

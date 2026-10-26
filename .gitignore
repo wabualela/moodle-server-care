@@ -1,0 +1,6 @@
+# never commit runtime facts or secrets
+*.env
+server.env
+*.bak-*
+*.log
+.DS_Store

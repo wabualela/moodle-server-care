@@ -1,0 +1,55 @@
+# Rendered by moodle-server-care skills/backup/scripts/render-install.sh on @RENDERED@.
+# Target: /etc/default/@NAME@ (root:root 0600). Sourced by /usr/local/sbin/@NAME@ and @NAME@-retention.
+# Only settings for THIS server go here; every other default is in the scripts.
+# NO token, NO keys and NO crypt passphrases here: they live only in /var/lib/@NAME@/rclone/rclone.conf.
+
+BACKEND=@BACKEND@                 # onedrive = SharePoint document library, s3 = Cloudflare R2 / S3-compatible
+SET_PREFIX=@SET_PREFIX@
+MOODLE=@MOODLE@
+DATAROOT=@DATAROOT@
+DBTYPE=@DBTYPE@
+DBNAME=@DBNAME@
+WEBUSER=@WEBUSER@
+HARD_STOP=@HARD_STOP@             # no step starts after this time of day (the unit kills the run at @HARD_STOP@ + 5 min)
+RUN_BUDGET_MIN=@BUDGET_MIN@
+WEEKLY_DOW=@WEEKLY_DOW@           # date +%u: 1 = Monday ... 5 = Friday ... 7 = Sunday (weekly copy + code snapshot)
+
+# Heartbeat: REQUIRED. A real run stops without it, and the timer must not be enabled before it is set.
+# healthchecks.io check "@NAME@ @SITE@": schedule = cron "@HC_CRON@", time zone = the server's (@TZ@), grace 90 min.
+# The ping URL contains a private UUID: the OWNER pastes it here himself with:  sudoedit /etc/default/@NAME@
+#HC_URL="https://hc-ping.com/<owner-pastes-uuid-here>"
+
+# Optional failure mail through the local MTA. MAIL_FROM must be a sender the relay accepts (a verified domain at the
+# mail provider, for example Moodle's no-reply address); without it the relay rejects the mail. healthchecks.io stays
+# the alert that counts: a dry run never mails, and the warning mail depends on the MTA working inside the sandbox.
+#MAIL_TO="it@example.org"
+#MAIL_FROM="noreply@example.org"
+
+# Retention: apply = this server deletes old copies (SharePoint: no lifecycle rules exist there);
+#            check = the bucket's lifecycle rules delete, this server only reports (S3/R2 with lifecycle + lock rules).
+RETENTION_MODE=@RETENTION_MODE@
+
+# Throttling. SharePoint: raise TPSLIMIT only if runs are slow AND the logs show no 429/503.
+#TPSLIMIT=@TPSLIMIT_HINT@
+#TRANSFERS=4
+#BWLIMIT=25M
+
+# One-off overrides after a checked, real mass deletion (set for ONE run, then comment out again). MAX_DELETE also caps
+# how many mirror files --reconcile accepts as missing locally (more = "finish copying filedir first").
+#MAX_DELETE=1000
+#MIN_SHRINK_PCT=70
+
+# DB login: empty = root over the unix socket. For a DB root cannot reach that way, the OWNER writes a root-only
+# option file ([client] user/password/socket, mode 0600) and names it here.
+#DB_DEFAULTS_FILE=/etc/@NAME@/db.cnf
+
+# Other apps on this server with SQLite data (owner decision), e.g. (appname=/var/www/app/database/database.sqlite)
+SQLITE_DBS=(@SQLITE_DBS@)
+
+# Paths for the daily encrypted config bundle (only paths that existed when this file was rendered; a path that
+# disappears later produces a warning, which is the point). moodledata (without filedir and caches) is always added.
+CONFIG_PATHS=(
+@CONFIG_PATHS@
+)
+# Extra paths (owner decision).
+EXTRA_PATHS=(@EXTRA_PATHS@)

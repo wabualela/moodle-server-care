@@ -1,0 +1,879 @@
+#!/usr/bin/python3 -I
+"""moodle-health: one-minute health check of a production Moodle server, reported to healthchecks.io.
+
+Read-only towards the system: it reads services, logs, the mail queue and local HTTP responses, and writes only its
+own state directory. It never prints or logs the ping URL.
+Settings: /etc/default/moodle-health (KEY=VALUE, no secrets). Ping URL: /etc/default/moodle-health.url (root 600,
+written by the owner with a no-echo command). Installed as /usr/local/sbin/moodle-health, run by moodle-health.timer.
+
+Usage: moodle-health                 normal run (systemd timer, every minute; needs root)
+       moodle-health --dry-run       run all checks, print the result, send nothing, leave the state untouched
+       moodle-health --self-check    show which checks are active or skipped and why (read-only, sends nothing)
+       moodle-health --status        show the last result, mute and baseline (read-only, sends nothing)
+       moodle-health --baseline      record the currently failing Moodle status checks as known
+       moodle-health --mute MINUTES  silence alerts during planned work (max 720; pings say MUTED); --unmute
+       moodle-health --test-fail     send one test alert, then a recovery ping (only when the owner asks for it)
+
+Test overrides (environment): MOODLE_HEALTH_CONF, MOODLE_HEALTH_URLFILE, MOODLE_HEALTH_STATE,
+MOODLE_HEALTH_PING_SINK (append pings to this file instead of sending them), MOODLE_HEALTH_BUDGET (seconds, max 40).
+When CONF or STATE is overridden but URLFILE is not, nothing is sent: a test must never use the real ping URL.
+
+Notes: mute does not stop the checks (they still probe the site and the database); a reboot or a stopped timer means
+missing pings, which healthchecks.io reports no matter what this script says: stop the timer and pause the check.
+"""
+import argparse, datetime, hashlib, ipaddress, json, os, re, shutil, subprocess, sys, time, urllib.parse, urllib.request
+
+VERSION = '1.0.0'
+DEFAULT_CONF = '/etc/default/moodle-health'
+DEFAULT_URLFILE = '/etc/default/moodle-health.url'
+DEFAULT_STATE = '/var/lib/moodle-health'
+CONF = os.environ.get('MOODLE_HEALTH_CONF', DEFAULT_CONF)
+URLFILE = os.environ.get('MOODLE_HEALTH_URLFILE', DEFAULT_URLFILE)       # tests point this at a missing path
+STATE = os.environ.get('MOODLE_HEALTH_STATE', DEFAULT_STATE)
+PING_SINK = os.environ.get('MOODLE_HEALTH_PING_SINK', '')                 # tests: record pings in a file
+try:
+    BUDGET_SEC = max(1, min(40, int(os.environ.get('MOODLE_HEALTH_BUDGET', '40'))))
+except ValueError:
+    BUDGET_SEC = 40      # the whole run must finish well inside the unit's TimeoutStartSec=55
+DEADLINE = time.monotonic() + BUDGET_SEC
+DRY = False
+SKIP = 'skipped: time budget used up'
+BUDGET_HIT = False
+DEFAULTS = {
+    'WWWROOT': '', 'SITE': '', 'MOODLE': '', 'DATAROOT': '', 'PHPBIN': 'php', 'WEBUSER': 'www-data',
+    'SERVICES': '',
+    'PROBE_ADDR': '127.0.0.1',     # where the web server answers on this machine (127.0.0.1, ::1 or a local IP)
+    'LOGIN_PATH': '/login/index.php', 'LOGIN_MARKER': 'name="logintoken"',
+    'DBTYPE': 'mariadb', 'DBHOST': '',
+    'REDIS_CHECK': 'auto', 'REDIS_CLI_ARGS': '',
+    'ACCESS_LOG': '', 'ACCESS_LOG_VHOST': '', 'FPM_LOGS': '', 'APACHE_ERROR_LOG': '', 'CRON_LOG': '',
+    'MTA': 'auto', 'CF_RANGES_FILE': '', 'EXTRA_SITES': '', 'DISK_PATHS': '',
+    'WINDOW_MIN': '5', 'ERR5XX_MIN': '20', 'ERR5XX_PCT': '5', 'SLOW_SEC': '5',
+    'DISK_CRIT_PCT': '90', 'MEM_CRIT_PCT': '5', 'MAIL_STUCK_CRIT': '10', 'MAIL_STUCK_MIN': '15',
+    'CERT_CRIT_DAYS': '14', 'CRON_STALE_MIN': '10', 'MOODLE_CHECKS_EVERY_MIN': '15',
+    'MOODLE_CHECKS_IGNORE': '', 'MOODLE_WARN_AS_CRIT': '',
+    'CONFIRM_OF': '3', 'CONFIRM_NEED': '2',   # a problem is confirmed when seen in NEED of the last OF runs
+}
+NO = ('no', 'off', '0', 'false')
+
+
+def load_conf():
+    c = dict(DEFAULTS)
+    try:
+        for line in open(CONF, encoding='utf-8'):
+            if line.lstrip().startswith('#'):
+                continue
+            m = re.match(r'^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$', line)
+            if m:
+                v = re.sub(r'\s+#.*$', '', m.group(2))          # allow trailing comments
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in '"\'':
+                    v = v[1:-1]
+                c[m.group(1)] = v
+    except FileNotFoundError:
+        pass
+    return c
+
+
+def num(c, key):
+    try:
+        return int(c[key])
+    except (KeyError, ValueError):
+        return int(DEFAULTS[key])
+
+
+def have(tool):
+    return shutil.which(tool) is not None
+
+
+def run(cmd, timeout=8, stdin=None):
+    global BUDGET_HIT
+    left = DEADLINE - time.monotonic()
+    if left < 1:
+        BUDGET_HIT = True
+        return 124, SKIP      # callers treat SKIP as "not checked", never as a failure
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, errors='replace', timeout=min(timeout, left),
+                           input=stdin, stdin=None if stdin is not None else subprocess.DEVNULL)
+        return p.returncode, (p.stdout or '') + (p.stderr or '')
+    except subprocess.TimeoutExpired:
+        return 124, 'timeout'
+    except FileNotFoundError:
+        return 127, 'not installed'
+
+
+def tail_text(path, max_bytes):
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, 2); size = f.tell(); f.seek(max(0, size - max_bytes))
+            return f.read().decode('utf-8', 'replace')
+    except OSError:
+        return None
+
+
+def save_json(path, obj):
+    """Atomic write; raises OSError (e.g. disk full) so the caller can react."""
+    tmp = f'{path}.tmp.{os.getpid()}'
+    try:
+        with open(tmp, 'w') as f:
+            json.dump(obj, f); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def target(c):
+    """Scheme, host, port and base path of the Moodle site, from WWWROOT (preferred) or SITE."""
+    w = c['WWWROOT'].strip()
+    if w:
+        u = urllib.parse.urlsplit(w if '://' in w else 'https://' + w)
+        scheme = u.scheme or 'https'
+        return {'scheme': scheme, 'host': u.hostname or '', 'port': u.port or (443 if scheme == 'https' else 80),
+                'base': u.path.rstrip('/')}
+    return {'scheme': 'https', 'host': c['SITE'].strip(), 'port': 443, 'base': ''}
+
+
+# ---------------------------------------------------------------- checks: each returns [(level, key, message)]
+def check_services(c):
+    out = []
+    if not have('systemctl'):
+        return out
+    for s in c['SERVICES'].split():
+        rc, txt = run(['systemctl', 'is-active', '--quiet', s], 5)
+        if txt == SKIP:
+            break
+        if rc != 0:
+            _, state = run(['systemctl', 'is-active', s], 5)
+            st = state.strip().splitlines()[-1] if state.strip() else 'not active'
+            out.append(('crit', f'svc:{s}', f'service {s} is {st}'))
+    return out
+
+
+def probe(host, path, timeout, scheme='https', port=None, addr='127.0.0.1', jar=None):
+    """GET to this server (addr) with the right Host/SNI; returns (code, seconds, body). -k: origin certificates
+    (Cloudflare Origin CA, self-signed) are not publicly trusted; expiry is checked separately."""
+    port = port or (443 if scheme == 'https' else 80)
+    a = f'[{addr}]' if ':' in addr and not addr.startswith('[') else addr
+    hostport = host if port == (443 if scheme == 'https' else 80) else f'{host}:{port}'
+    cmd = ['curl', '-sk', '--max-time', str(timeout), '-A', 'moodle-health', '--resolve', f'{host}:{port}:{a}',
+           '-w', '\n%{http_code} %{time_total}']
+    if jar:
+        cmd += ['-b', jar, '-c', jar]      # reuse one session instead of creating a new one every minute
+    cmd.append(f'{scheme}://{hostport}{path}')
+    rc, txt = run(cmd, timeout + 2)
+    if txt == SKIP:
+        return -1, 0.0, ''
+    body, _, tail = txt.rpartition('\n')
+    try:
+        code, secs = tail.split()
+        return int(code), float(secs), body
+    except ValueError:
+        return 0, 0.0, ''
+
+
+def check_site(c):
+    t = target(c)
+    if not t['host'] or not have('curl'):
+        return []
+    jar = None if DRY else os.path.join(STATE, 'cookies.txt')
+    code, secs, body = probe(t['host'], t['base'] + c['LOGIN_PATH'], 10, t['scheme'], t['port'], c['PROBE_ADDR'], jar)
+    if code == -1:
+        return []
+    low = body.lower()
+    if code == 503 and 'maintenance' in low:
+        return [('crit', 'site', 'site is in maintenance mode (HTTP 503)')]
+    if code != 200:
+        return [('crit', 'site', f'login page HTTP {code or "no answer"} from the web server on this machine')]
+    if re.search(r'dbconnectionfailed|Database connection failed|error/dmlexception|dmlreadexception', body):
+        return [('crit', 'site', 'login page shows a database error')]
+    if c['LOGIN_MARKER'] not in body:
+        if 'maintenance' in low:
+            return [('crit', 'site', 'site is in maintenance mode')]
+        return [('crit', 'site', 'login page answered 200 but without the login form')]
+    if secs > num(c, 'SLOW_SEC'):
+        return [('warn', 'site-slow', f'login page took {secs:.1f} s')]
+    return []
+
+
+def check_extra_sites(c):
+    """Other vhosts on this box, entries host or host/path (default /favicon.ico: static, creates no sessions)."""
+    out = []
+    if not have('curl'):
+        return out
+    for entry in c['EXTRA_SITES'].split():
+        host, slash, path = entry.partition('/')
+        code, _, _ = probe(host, '/' + path if slash else '/favicon.ico', 5, addr=c['PROBE_ADDR'])
+        if code == -1:
+            break
+        if code == 0 or code >= 500:
+            out.append(('crit', f'extra:{host}', f'{host} HTTP {code or "no answer"}'))
+    return out
+
+
+def check_db(c):
+    """Liveness only, no credentials: mysqladmin ping exits 0 even on 'access denied' (the server answered)."""
+    t = c['DBTYPE'].lower()
+    host = c['DBHOST'].strip()
+    remote = bool(host) and host not in ('localhost', '127.0.0.1', '::1') and not host.startswith('/')
+    if t in ('pgsql', 'postgres', 'postgresql'):
+        if not have('pg_isready'):
+            return []
+        rc, txt = run(['pg_isready', '-q', '-t', '5'] + (['-h', host] if host else []), 7)
+        return [] if rc == 0 or txt == SKIP else [('crit', 'db', 'PostgreSQL does not accept connections (pg_isready)')]
+    if t in ('mariadb', 'mysqli', 'mysql', 'auroramysql', ''):
+        tool = next((x for x in ('mariadb-admin', 'mysqladmin') if have(x)), None)
+        if not tool:
+            return []
+        rc, txt = run([tool, 'ping', '--silent', '--connect-timeout=5'] + (['-h', host] if remote else []), 7)
+        return [] if rc == 0 or txt == SKIP else [('crit', 'db', 'database does not answer ping')]
+    return []      # sqlsrv / oci: no generic liveness tool; the login-page check still catches DB errors
+
+
+def check_redis(c):
+    if c['REDIS_CHECK'].lower() in NO or not have('redis-cli'):
+        return []
+    rc, txt = run(['redis-cli'] + c['REDIS_CLI_ARGS'].split() + ['ping'], 5)
+    if txt == SKIP:
+        return []
+    # NOAUTH: Redis answered but wants a password; alive is all we need, so no password is ever passed here.
+    return [] if ('PONG' in txt or 'NOAUTH' in txt) else [('crit', 'redis', f'redis does not answer ({txt.strip()[:60]})')]
+
+
+# nginx $time_local and Apache %t share the format; "request" may contain escaped quotes (Apache \", nginx \x22).
+ACCESS_RX = re.compile(r'\[(\d{2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2} [+-]\d{4})\] "(?:[^"\\]|\\.)*" (\d{3}) ')
+
+
+def access_window(c, path):
+    """Returns (seen, parsed, total_in_window, bad_in_window) for one access log, or None if unreadable."""
+    text = tail_text(path, 8 * 1024 * 1024)
+    if text is None:
+        return None
+    since = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=num(c, 'WINDOW_MIN'))
+    vhost = c['ACCESS_LOG_VHOST'].strip()
+    seen = parsed = total = bad = older = 0
+    for line in reversed(text.splitlines()[-60000:]):
+        if not line.strip():
+            continue
+        seen += 1
+        m = ACCESS_RX.search(line)
+        if not m:
+            continue
+        parsed += 1
+        try:
+            t = datetime.datetime.strptime(m.group(1), '%d/%b/%Y:%H:%M:%S %z')
+        except ValueError:
+            continue
+        if t < since:
+            older += 1
+            if older > 300:           # lines are nearly chronological; stop after a run of older lines
+                break
+            continue
+        older = 0
+        if vhost and not line.startswith(vhost + ':'):     # Apache vhost_combined: "host:port client ..."
+            continue
+        total += 1
+        if m.group(2) in ('500', '502', '503', '504'):
+            bad += 1
+    return seen, parsed, total, bad
+
+
+def check_http_errors(c):
+    out = []
+    total = bad = 0
+    for path in c['ACCESS_LOG'].split():
+        r = access_window(c, path)
+        if r is None:
+            out.append(('warn', f'accesslog:{path}', f'cannot read {path}'))
+            continue
+        seen, parsed, t, b = r
+        if seen >= 20 and parsed == 0:
+            out.append(('warn', f'accesslog:{path}', f'{os.path.basename(path)}: log format not recognised (5xx check blind)'))
+        total += t; bad += b
+    if bad >= num(c, 'ERR5XX_MIN') and total and bad * 100 >= num(c, 'ERR5XX_PCT') * total:
+        out.append(('crit', '5xx', f'{bad} of {total} requests failed with 5xx in the last {c["WINDOW_MIN"]} min'))
+    return out
+
+
+def check_fpm(c):
+    out = []
+    since = datetime.datetime.now() - datetime.timedelta(minutes=num(c, 'WINDOW_MIN'))
+    rx = re.compile(r'^\[(\d{2}-\w{3}-\d{4} \d{2}:\d{2}:\d{2})\] WARNING: \[pool (\S+)\] server reached (pm\.)?max_children')
+    for path in c['FPM_LOGS'].split():
+        hits, pool = 0, ''
+        for line in (tail_text(path, 2 * 1024 * 1024) or '').splitlines():
+            m = rx.match(line)
+            if m:
+                try:
+                    if datetime.datetime.strptime(m.group(1), '%d-%b-%Y %H:%M:%S') >= since:
+                        hits += 1; pool = m.group(2)
+                except ValueError:
+                    pass
+        if hits >= 2:
+            out.append(('crit', f'fpm:{path}', f'PHP-FPM pool {pool} hit max_children {hits} times in {c["WINDOW_MIN"]} min ({os.path.basename(path)})'))
+        elif hits == 1:
+            out.append(('warn', f'fpm:{path}', f'PHP-FPM pool {pool} hit max_children once ({os.path.basename(path)})'))
+    return out
+
+
+def check_apache_workers(c):
+    """Apache logs 'server reached MaxRequestWorkers' about once per restart, so it is only ever a warning."""
+    path = c['APACHE_ERROR_LOG']
+    if not path:
+        return []
+    since = datetime.datetime.now() - datetime.timedelta(minutes=num(c, 'WINDOW_MIN'))
+    rx = re.compile(r'^\[\w{3} (\w{3} \d{2} \d{2}:\d{2}:\d{2})(?:\.\d+)? (\d{4})\].*(AH00161|AH00484|reached MaxRequestWorkers)')
+    for line in reversed((tail_text(path, 1024 * 1024) or '').splitlines()):
+        m = rx.match(line)
+        if m:
+            try:
+                if datetime.datetime.strptime(f'{m.group(1)} {m.group(2)}', '%b %d %H:%M:%S %Y') >= since:
+                    return [('warn', 'apache-workers', 'Apache reached MaxRequestWorkers (visitors queue)')]
+            except ValueError:
+                pass
+            break
+    return []
+
+
+def check_disk_mem(c):
+    out, seen = [], set()
+    paths = c['DISK_PATHS'].split() or ['/', c['DATAROOT'] or '/', '/var/lib/mysql', '/var/lib/postgresql', '/var/log']
+    for path in paths:
+        try:
+            dev = os.stat(path).st_dev
+        except OSError:
+            continue
+        if dev in seen:
+            continue
+        seen.add(dev)
+        st = os.statvfs(path)
+        used = 100 - st.f_bavail * 100 // max(st.f_blocks, 1)
+        iused = 100 - st.f_favail * 100 // max(st.f_files, 1) if st.f_files else 0
+        if used >= num(c, 'DISK_CRIT_PCT'):
+            out.append(('crit', f'disk:{path}', f'disk holding {path} is {used}% full'))
+        if iused >= num(c, 'DISK_CRIT_PCT'):
+            out.append(('crit', f'inode:{path}', f'inodes for {path} {iused}% used'))
+    try:
+        mi = dict(l.split(':', 1) for l in open('/proc/meminfo'))
+        avail = int(mi['MemAvailable'].split()[0]); total = int(mi['MemTotal'].split()[0])
+        if avail * 100 < num(c, 'MEM_CRIT_PCT') * total:
+            out.append(('crit', 'mem', f'only {avail // 1024} MB memory available'))
+    except (OSError, KeyError, ValueError):
+        pass
+    return out
+
+
+def check_cron(c):
+    path = c['CRON_LOG']
+    if not path:
+        return []
+    try:
+        age = (time.time() - os.stat(path).st_mtime) / 60
+    except OSError:
+        return [('warn', 'cronlog', f'cannot stat {path}')]
+    if age > num(c, 'CRON_STALE_MIN'):
+        return [('crit', 'cron', f'Moodle cron log not written for {int(age)} min')]
+    return []
+
+
+def mail_result(stuck, waiting, bounces, held, c, frozen_word):
+    """Critical only for real mail stuck in the queue; old bounces and held mail are warnings."""
+    out, mins = [], c['MAIL_STUCK_MIN']
+    if stuck >= num(c, 'MAIL_STUCK_CRIT'):
+        out.append(('crit', 'mailq', f'{stuck} messages stuck in the mail queue for over {mins} min'))
+    elif waiting > 0:
+        out.append(('warn', 'mailq', f'{waiting} message(s) waiting over {mins} min'))
+    if bounces > 0:
+        out.append(('warn', 'mailfrozen', f'{bounces} {frozen_word} in the mail queue'))
+    if held > 0:
+        out.append(('warn', 'mailhold', f'{held} message(s) on hold in the mail queue'))
+    return out
+
+
+def exim_queue(c):
+    rc, txt = run(['exiqgrep', '-c', '-x', '-o', str(num(c, 'MAIL_STUCK_MIN') * 60)], 6)   # not frozen, older than
+    m = re.search(r'^(\d+) matches', txt, re.M)
+    n = int(m.group(1)) if m else 0
+    rc, txt = run(['exiqgrep', '-c', '-z'], 6)
+    m = re.search(r'^(\d+) matches', txt, re.M)
+    frozen = int(m.group(1)) if m else 0
+    return mail_result(n, n, frozen, 0, c, 'frozen message(s) (usually old bounces; they expire by themselves)')
+
+
+def postfix_entries(c):
+    """[(queue, arrival_epoch, sender)] from `postqueue -j` (Postfix >= 3.1), else from `mailq` text."""
+    rc, txt = run(['postqueue', '-j'], 8)
+    if rc == 0 and (not txt.strip() or txt.lstrip().startswith('{')):
+        out = []
+        for line in txt.splitlines():
+            try:
+                j = json.loads(line)
+                out.append((j.get('queue_name', ''), float(j.get('arrival_time', 0)), j.get('sender', '')))
+            except ValueError:
+                continue
+        return out
+    if not have('mailq'):
+        return None
+    rc, txt = run(['mailq'], 8)
+    if rc != 0 and 'Mail queue is empty' not in txt:
+        return None          # e.g. "mail system is down": the service check reports that
+    out, now = [], datetime.datetime.now()
+    rx = re.compile(r'^([0-9A-Za-z]{5,})([*!]?)\s+\d+\s+\w{3} (\w{3}\s+\d+ \d{2}:\d{2}:\d{2})\s+(\S*)')
+    for line in txt.splitlines():
+        m = rx.match(line)
+        if not m:
+            continue
+        try:
+            t = datetime.datetime.strptime(f'{now.year} {m.group(3)}', '%Y %b %d %H:%M:%S')
+        except ValueError:
+            continue
+        if t > now + datetime.timedelta(days=1):       # no year in mailq output: December mail seen in January
+            t = t.replace(year=now.year - 1)
+        q = {'*': 'active', '!': 'hold'}.get(m.group(2), 'deferred')
+        out.append((q, t.timestamp(), m.group(4)))
+    return out
+
+
+def postfix_queue(c):
+    entries = postfix_entries(c)
+    if entries is None:
+        return []
+    old = time.time() - num(c, 'MAIL_STUCK_MIN') * 60
+    stuck = bounces = held = 0
+    for q, arrival, sender in entries:
+        if q == 'hold':
+            held += 1
+        elif arrival and arrival < old:
+            if sender in ('', 'MAILER-DAEMON'):
+                bounces += 1
+            else:
+                stuck += 1
+    return mail_result(stuck, stuck, bounces, held, c, 'old bounce(s) waiting (like frozen bounces; they expire)')
+
+
+def check_mail(c):
+    mta = c['MTA'].lower()
+    if mta in NO or mta == 'none':
+        return []
+    if mta in ('auto', 'exim', 'exim4') and have('exiqgrep'):
+        return exim_queue(c)
+    if mta in ('auto', 'postfix') and have('postqueue'):
+        return postfix_queue(c)
+    return []
+
+
+IPNET_RX = re.compile(r'^[0-9a-fA-F:.]+(/\d{1,3})?$')
+
+
+def proxy_ranges(path, depth=0):
+    """Trusted proxy ranges from nginx set_real_ip_from, Apache RemoteIP*Proxy(List) or a plain list of CIDRs."""
+    nets, plain = [], []
+    for raw in open(path, encoding='utf-8', errors='replace'):
+        line = raw.split('#', 1)[0].strip().rstrip(';').strip()
+        if not line:
+            continue
+        words = line.split()
+        key = words[0].lower()
+        if key == 'set_real_ip_from' or key in ('remoteiptrustedproxy', 'remoteipinternalproxy'):
+            nets += [w for w in words[1:] if IPNET_RX.match(w)]
+        elif key in ('remoteiptrustedproxylist', 'remoteipinternalproxylist') and len(words) > 1 and depth == 0:
+            nets += [str(n) for n in proxy_ranges(words[1], 1)]
+        elif len(words) == 1 and IPNET_RX.match(words[0]):
+            plain.append(words[0])
+    out = []
+    for n in (nets or plain):
+        try:
+            out.append(ipaddress.ip_network(n, strict=False))
+        except ValueError:
+            pass
+    return out
+
+
+def check_fail2ban(c):
+    """A ban on a proxy/CDN edge address blocks every student behind that edge (the first server's outage)."""
+    path = c['CF_RANGES_FILE']
+    if not path or not have('fail2ban-client'):
+        return []
+    try:
+        nets = proxy_ranges(path)
+    except OSError:
+        return [('warn', 'cfranges', f'cannot read proxy ranges from {path}')]
+    if not nets:
+        return [('warn', 'cfranges', f'no proxy ranges found in {path}')]
+    rc, txt = run(['fail2ban-client', 'status'], 6)
+    m = re.search(r'Jail list:\s*(.*)', txt)
+    out = []
+    for jail in [j.strip() for j in (m.group(1).split(',') if m else []) if j.strip()]:
+        rc, jt = run(['fail2ban-client', 'status', jail], 6)
+        bm = re.search(r'Banned IP list:\s*(.*)', jt)
+        for ip in (bm.group(1).split() if bm else []):
+            try:
+                a = ipaddress.ip_address(ip)
+            except ValueError:
+                continue
+            if any(a.version == n.version and a in n for n in nets):
+                out.append(('crit', f'f2b:{jail}', f'fail2ban jail {jail} banned proxy/CDN address {ip}: visitors behind it are blocked'))
+                break
+    return out
+
+
+def check_cert(c):
+    t = target(c)
+    if t['scheme'] != 'https' or not t['host'] or not have('openssl'):
+        return []
+    cache = os.path.join(STATE, 'cert.json')
+    d = load_json(cache, {})
+    if time.time() - d.get('t', 0) > 3600:
+        addr = c['PROBE_ADDR']
+        a = f'[{addr}]' if ':' in addr and not addr.startswith('[') else addr
+        rc, pem = run(['openssl', 's_client', '-connect', f'{a}:{t["port"]}', '-servername', t['host']], 8, stdin='')
+        if pem == SKIP:
+            return []
+        rc2, txt = run(['openssl', 'x509', '-noout', '-enddate'], 5, stdin=pem)
+        m = re.search(r'notAfter=(.*)', txt)
+        if not m:
+            return [('warn', 'cert', 'cannot read the site certificate')]
+        d = {'t': time.time(), 'end': m.group(1).strip()}
+        if not DRY:
+            try:
+                save_json(cache, d)
+            except OSError:
+                pass
+    try:
+        end = datetime.datetime.strptime(d['end'], '%b %d %H:%M:%S %Y %Z').replace(tzinfo=datetime.timezone.utc)
+    except (KeyError, ValueError):
+        return [('warn', 'cert', 'cannot parse the certificate date')]
+    days = (end - datetime.datetime.now(datetime.timezone.utc)).days
+    return [('crit', 'cert', f'site certificate expires in {days} days')] if days < num(c, 'CERT_CRIT_DAYS') else []
+
+
+def parse_moodle_checks(txt, warn_refs=()):
+    """({ref: hash of its detail block}, header_ok) for ERROR/CRITICAL rows of admin/cli/checks.php (plus WARNING
+    rows of refs listed in warn_refs). Digits are normalised so changing counts do not look like a new message."""
+    txt = re.sub(r'\x1b\[[0-9;]*m', '', txt)
+    header_ok = bool(re.match(r'^(OK|WARNING|CRITICAL|UNKNOWN): ', txt))
+    blocks, cur, buf = {}, None, []
+
+    def close():
+        if cur:
+            blocks[cur] = hashlib.sha256(re.sub(r'\d+', '0', ' '.join(buf)).encode()).hexdigest()[:16]
+    for line in txt.splitlines():
+        m = re.match(r'^\s*(OK|INFO|NA|WARNING|ERROR|CRITICAL|UNKNOWN)\s*\|.*\(([a-z0-9_]+)\)\s*$', line)
+        if m:
+            close()
+            st, ref = m.group(1), m.group(2)
+            cur = ref if st in ('ERROR', 'CRITICAL') or (st == 'WARNING' and ref in warn_refs) else None
+            buf = []
+        elif cur:
+            buf.append(' '.join(line.split()))
+    close()
+    return blocks, header_ok
+
+
+def checks_php(c):
+    for p in ('admin/cli/checks.php', 'public/admin/cli/checks.php'):    # 5.1+ keeps admin/cli outside public/
+        f = os.path.join(c['MOODLE'], p)
+        if c['MOODLE'] and os.path.isfile(f):
+            return f
+    return None
+
+
+def moodle_checks(c, force=False):
+    cache = os.path.join(STATE, 'moodle-checks.json')
+    d = load_json(cache, {})
+    if not force and time.time() - d.get('t', 0) < num(c, 'MOODLE_CHECKS_EVERY_MIN') * 60:
+        return d.get('refs', {}), d.get('ok', True), d.get('fails', 0)
+    script = checks_php(c)
+    # Never run Moodle CLI as root: it would leave root-owned cache files in the dataroot.
+    uid = ['setpriv', f'--reuid={c["WEBUSER"]}', f'--regid={c["WEBUSER"]}', '--init-groups']
+    rc, txt = run(uid + [c['PHPBIN'], script, '--type=status'], 25)
+    if txt == SKIP and not force:
+        return d.get('refs', {}), d.get('ok', True), d.get('fails', 0)    # other checks used the time: retry next run
+    refs, header_ok = parse_moodle_checks(txt, set(c['MOODLE_WARN_AS_CRIT'].split()))
+    ok = rc in (0, 1, 2, 3) and header_ok
+    fails = 0 if ok else d.get('fails', 0) + 1
+    if not DRY:
+        try:
+            save_json(cache, {'t': time.time(), 'refs': refs, 'ok': ok, 'fails': fails})
+        except OSError:
+            pass
+    return refs, ok, fails
+
+
+def check_moodle(c):
+    if not checks_php(c) or not have('setpriv'):
+        return []
+    refs, ok, fails = moodle_checks(c)
+    if not ok:
+        lvl = 'crit' if fails >= 2 else 'warn'
+        return [(lvl, 'moodlechecks', f'Moodle status checks could not run ({fails} time(s) in a row)')]
+    base = load_json(os.path.join(STATE, 'moodle-checks.baseline'), {})
+    if isinstance(base, list):
+        base = {r: None for r in base}
+    ignore = set(c['MOODLE_CHECKS_IGNORE'].split())
+    out = []
+    for r, h in refs.items():
+        if r in ignore:
+            continue
+        if r not in base:
+            out.append(('crit', f'moodle:{r}', f'Moodle status check failing: {r}'))
+        elif base[r] is not None and base[r] != h:
+            out.append(('crit', f'moodle:{r}', f'Moodle status check {r} still failing, with a different message than the baseline'))
+    return out
+
+
+# order matters for the time budget: the essentials first
+CHECKS = [check_services, check_site, check_db, check_redis, check_http_errors, check_fpm, check_apache_workers,
+          check_disk_mem, check_cron, check_fail2ban, check_mail, check_extra_sites, check_cert, check_moodle]
+
+
+def skip_reason(c, name):
+    """Why a check does nothing on this server (for --self-check); None when it is active."""
+    t = target(c)
+    reasons = {
+        'check_services': (not c['SERVICES'].split() and 'SERVICES is empty') or (not have('systemctl') and 'systemctl not found'),
+        'check_site': (not t['host'] and 'WWWROOT/SITE not set') or (not have('curl') and 'curl not installed'),
+        'check_db': None,
+        'check_redis': (c['REDIS_CHECK'].lower() in NO and 'REDIS_CHECK=no') or (not have('redis-cli') and 'redis-cli not installed'),
+        'check_http_errors': not c['ACCESS_LOG'].split() and 'ACCESS_LOG is empty',
+        'check_fpm': not c['FPM_LOGS'].split() and 'FPM_LOGS is empty',
+        'check_apache_workers': not c['APACHE_ERROR_LOG'] and 'APACHE_ERROR_LOG is empty',
+        'check_disk_mem': None,
+        'check_cron': not c['CRON_LOG'] and 'CRON_LOG is empty (Moodle status checks still report cron after a day)',
+        'check_fail2ban': (not c['CF_RANGES_FILE'] and 'CF_RANGES_FILE is empty') or (not have('fail2ban-client') and 'fail2ban not installed'),
+        'check_mail': (c['MTA'].lower() in NO + ('none',) and 'MTA=none') or
+                      (not (have('exiqgrep') or have('postqueue')) and 'no exim (exiqgrep) or Postfix (postqueue) found'),
+        'check_extra_sites': not c['EXTRA_SITES'].split() and 'EXTRA_SITES is empty',
+        'check_cert': (t['scheme'] != 'https' and 'site is not https') or (not have('openssl') and 'openssl not installed'),
+        'check_moodle': (not checks_php(c) and 'admin/cli/checks.php not found under MOODLE') or (not have('setpriv') and 'setpriv not installed'),
+    }
+    if name == 'check_db':
+        dt = c['DBTYPE'].lower()
+        if dt in ('pgsql', 'postgres', 'postgresql'):
+            return None if have('pg_isready') else 'pg_isready not installed'
+        if dt in ('mariadb', 'mysqli', 'mysql', 'auroramysql', ''):
+            return None if (have('mariadb-admin') or have('mysqladmin')) else 'mariadb-admin/mysqladmin not installed'
+        return f'DBTYPE {dt} has no generic ping (login-page check still sees DB errors)'
+    return reasons.get(name) or None
+
+
+# ---------------------------------------------------------------- reporting
+def ping(suffix, body):
+    if DRY:
+        return 'dry run: not sent'
+    if PING_SINK:
+        try:
+            with open(PING_SINK, 'a') as f:
+                f.write(json.dumps({'t': time.time(), 'suffix': suffix, 'body': body}) + '\n')
+            return 'recorded in test sink'
+        except OSError as e:
+            return f'test sink not writable: {type(e).__name__}'
+    if URLFILE == DEFAULT_URLFILE and (CONF != DEFAULT_CONF or STATE != DEFAULT_STATE):
+        return 'not sent: test settings with the real ping URL file (set MOODLE_HEALTH_URLFILE to a test path)'
+    try:
+        url = open(URLFILE).read().strip()
+    except OSError:
+        return 'no ping URL yet (local only)'
+    if not url.startswith('https://'):
+        return 'ping URL file is not an https URL'
+    try:
+        req = urllib.request.Request(url.rstrip('/') + suffix, data=body.encode('utf-8')[:10000],
+                                     headers={'User-Agent': 'moodle-health'})
+        urllib.request.urlopen(req, timeout=8).read()
+        return 'sent'
+    except Exception as e:  # network trouble must not crash the check
+        return f'ping failed: {type(e).__name__}'
+
+
+def mute_until():
+    try:
+        return float(open(os.path.join(STATE, 'mute')).read())
+    except (OSError, ValueError):
+        return 0.0
+
+
+def is_muted():
+    return time.time() < mute_until()
+
+
+def write_text(path, text):
+    tmp = f'{path}.tmp.{os.getpid()}'
+    with open(tmp, 'w') as f:
+        f.write(text); f.flush(); os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def url_file_info():
+    try:
+        st = os.stat(URLFILE)
+    except OSError:
+        return 'absent'
+    owner = 'root' if st.st_uid == 0 else f'uid {st.st_uid}'
+    return f'present, owner {owner}, mode {oct(st.st_mode & 0o777)[2:]}, {st.st_size} bytes (content never shown)'
+
+
+def self_check(c):
+    t = target(c)
+    print(f'moodle-health {VERSION} self-check (read-only, sends nothing)')
+    print(f'config        {CONF} ({"found" if os.path.exists(CONF) else "MISSING: defaults only"})')
+    print(f'ping URL file {URLFILE}: {url_file_info()}')
+    w = os.access(STATE, os.W_OK) if os.path.isdir(STATE) else False
+    print(f'state dir     {STATE} ({"writable" if w else "missing or not writable"})')
+    print(f'target        {t["scheme"]}://{t["host"]}:{t["port"]}{t["base"]}{c["LOGIN_PATH"]} via {c["PROBE_ADDR"]}')
+    for chk in CHECKS:
+        r = skip_reason(c, chk.__name__)
+        print(f'{chk.__name__[6:]:<16}{"SKIPPED: " + r if r else "active"}')
+    for path in c['ACCESS_LOG'].split():
+        r = access_window(c, path)
+        print(f'access log    {path}: ' + ('unreadable' if r is None else
+              f'{r[0]} lines read, {r[1]} parsed, {r[2]} in the last {c["WINDOW_MIN"]} min, {r[3]} of them 5xx'))
+    base = load_json(os.path.join(STATE, 'moodle-checks.baseline'), None)
+    print('moodle baseline ' + ('not recorded yet (run --baseline before writing the ping URL)' if base is None
+                                else ', '.join(sorted(base)) or 'recorded: none failing'))
+    if is_muted():
+        print('MUTED until', time.strftime('%F %T', time.localtime(mute_until())))
+
+
+def show_status():
+    last = load_json(os.path.join(STATE, 'last.json'), None)
+    print('last run:', json.dumps(last, ensure_ascii=False, indent=1) if last else 'none recorded')
+    if is_muted():
+        print('muted until', time.strftime('%F %T', time.localtime(mute_until())))
+    else:
+        print('not muted')
+    print('confirming:', ', '.join(sorted(load_json(os.path.join(STATE, 'history.json'), {}))) or 'nothing')
+    base = load_json(os.path.join(STATE, 'moodle-checks.baseline'), None)
+    print('moodle baseline:', 'not recorded' if base is None else (', '.join(sorted(base)) or 'none failing'))
+    print('ping URL file:', url_file_info())
+
+
+def main():
+    global DRY
+    ap = argparse.ArgumentParser(description='Moodle server health check (healthchecks.io).')
+    ap.add_argument('--dry-run', action='store_true', help='run the checks, print, send nothing, keep state untouched')
+    ap.add_argument('--baseline', action='store_true', help='record the failing Moodle status checks as known')
+    ap.add_argument('--mute', type=int, metavar='MINUTES', help='suppress alerts (max 720); probes keep running')
+    ap.add_argument('--unmute', action='store_true', help='end a mute now')
+    ap.add_argument('--test-fail', action='store_true', help='send one TEST alert + recovery (owner request only)')
+    ap.add_argument('--self-check', action='store_true', help='show active/skipped checks (read-only)')
+    ap.add_argument('--status', action='store_true', help='show last result, mute, baseline (read-only)')
+    ap.add_argument('--version', action='store_true', help='print the version')
+    a = ap.parse_args()
+    if a.version:
+        print(VERSION); return
+    c = load_conf()
+    if a.self_check:
+        self_check(c); return
+    if a.status:
+        show_status(); return
+    DRY = a.dry_run
+    if not DRY and os.geteuid() != 0 and STATE == DEFAULT_STATE:
+        print('run as root (sudo), or use --dry-run / --self-check / --status', file=sys.stderr); sys.exit(2)
+    if not DRY:
+        os.makedirs(STATE, mode=0o700, exist_ok=True)
+    host = os.uname().nodename
+    mutefile = os.path.join(STATE, 'mute')
+
+    if a.mute is not None:
+        minutes = max(1, min(a.mute, 720))
+        until = time.time() + minutes * 60
+        write_text(mutefile, str(until))
+        print('muted until', time.strftime('%F %T', time.localtime(until)), f'({minutes} min; probes keep running)'); return
+    if a.unmute:
+        try:
+            os.remove(mutefile)
+        except FileNotFoundError:
+            pass
+        print('unmuted'); return
+    if a.baseline:
+        if not checks_php(c):
+            print('admin/cli/checks.php not found under MOODLE; nothing to baseline'); sys.exit(1)
+        refs, ok, _ = moodle_checks(c, force=True)
+        if not ok:
+            print('Moodle status checks could not run; baseline NOT changed'); sys.exit(1)
+        save_json(os.path.join(STATE, 'moodle-checks.baseline'), refs)
+        print('baseline of known failing Moodle checks:', ', '.join(sorted(refs)) or 'none'); return
+    if a.test_fail:
+        print('test alert:', ping('/fail', f'[{host}] TEST alert from moodle-health, requested by the owner. No action needed.'))
+        time.sleep(5)
+        print('recovery:', ping('', f'[{host}] TEST finished: all good.')); return
+
+    results = []
+    for chk in CHECKS:
+        try:
+            results += chk(c)
+        except Exception as e:
+            results.append(('crit', f'internal:{chk.__name__}', f'check {chk.__name__} is broken: {type(e).__name__}'))
+
+    # confirmation: a critical problem counts when seen in CONFIRM_NEED of the last CONFIRM_OF runs
+    sfile = os.path.join(STATE, 'history.json')
+    hist = load_json(sfile, {})
+    of, need = max(1, num(c, 'CONFIRM_OF')), max(1, num(c, 'CONFIRM_NEED'))
+    now_keys = {k for lvl, k, _ in results if lvl == 'crit'}
+    keys = set(hist) | now_keys
+    hist = {k: (hist.get(k, []) + [1 if k in now_keys else 0])[-of:] for k in keys}
+    hist = {k: v for k, v in hist.items() if any(v)}
+    state_note = []
+    if not DRY:
+        try:
+            save_json(sfile, hist)
+        except OSError:
+            need = 1          # cannot remember anything: alert at once rather than stay silent
+            state_note.append('state directory not writable (disk full?): alerting without confirmation')
+    confirmed = sorted(k for k in now_keys if DRY or sum(hist.get(k, [])) >= need)
+    crit = [m for lvl, k, m in results if lvl == 'crit' and k in confirmed]
+    pending = [m for lvl, k, m in results if lvl == 'crit' and k not in confirmed]
+    warn = [m for lvl, k, m in results if lvl == 'warn'] + state_note
+    if BUDGET_HIT:
+        warn.append(f'time budget ({BUDGET_SEC} s) used up: the last checks were skipped this run')
+
+    muted = is_muted()
+    stamp = time.strftime('%F %T')
+    t = target(c)
+    lines = [f'[{host}] {t["host"]} {stamp}']
+    if muted:
+        lines.append('MUTED (planned work): alerts suppressed until ' + time.strftime('%H:%M', time.localtime(mute_until())))
+    lines += [f'CRITICAL: {m}' for m in crit] + [f'pending (confirming): {m}' for m in pending] + [f'warning: {m}' for m in warn]
+    if not (crit or pending or warn):
+        lines.append('all checks OK')
+    body = '\n'.join(lines)
+
+    if DRY:
+        print(body); return
+    last = os.path.join(STATE, 'last.json')
+    prev = load_json(last, {})
+    status = 'fail' if (crit and not muted) else 'ok'
+    if status == 'fail' and prev.get('status') == 'fail' and set(confirmed) - set(prev.get('keys', [])):
+        ping('', f'[{host}] re-arming alert for a new problem')   # healthchecks only alerts on a change
+    result = ping('/fail' if status == 'fail' else '', body)
+    try:
+        save_json(last, {'t': stamp, 'status': status, 'keys': confirmed if status == 'fail' else [], 'crit': crit,
+                         'warn': warn, 'ping': result})
+    except OSError:
+        pass
+    if prev.get('status') != status or crit:
+        print(body.replace('\n', ' | '), '| ping:', result)  # journal line only on change or while failing
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        # operator commands show their traceback; only real (timer) runs alert on a crash
+        quiet = {'--dry-run', '--self-check', '--status', '--version', '--baseline', '--mute', '--unmute',
+                 '--test-fail'} & set(a.split('=')[0] for a in sys.argv[1:])
+        if not quiet and not is_muted():
+            ping('/fail', f'[{os.uname().nodename}] moodle-health crashed: {type(e).__name__}')
+        raise

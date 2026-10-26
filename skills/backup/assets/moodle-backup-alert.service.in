@@ -1,0 +1,11 @@
+# Rendered by moodle-server-care skills/backup/scripts/render-install.sh. Target: /etc/systemd/system/@NAME@-alert.service
+# Started by OnFailure= of @NAME@.service, also after a timeout or kill, which the script's own trap cannot always
+# report. Sends healthchecks.io /fail with the last journal lines and, if MAIL_TO and MAIL_FROM are set in
+# /etc/default/@NAME@, one mail through the local MTA. Not sandboxed: it reads the journal and the MTA writes its spool.
+[Unit]
+Description=Alert for a failed off-provider backup of @SITE@
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/@NAME@ --alert
+TimeoutStartSec=2min

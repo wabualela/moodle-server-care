@@ -1,0 +1,18 @@
+# Rendered by moodle-server-care skills/backup/scripts/render-install.sh. Target: /etc/systemd/system/@NAME@.timer
+# OnCalendar is server local time (check: timedatectl). @AT@ = inside the measured quiet window (audit module,
+# quiet-hours.sh), before the unattended-upgrades window (@APT_AT@).
+# Enable ONLY after `@NAME@ --preflight` shows no FAIL (HC_URL set, seed done): references/install.md step 8.
+[Unit]
+Description=Nightly off-provider backup of @SITE@ at @AT@
+
+[Timer]
+OnCalendar=*-*-* @AT@:00
+RandomizedDelaySec=5min
+# 1s, not the 1min default: with 1min the start could slip by a minute more and the unit's hard stop past the
+# upgrade window.
+AccuracySec=1s
+# No catch-up after downtime: a missed night alerts (healthchecks.io gets no ping) instead of a dump in working hours.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

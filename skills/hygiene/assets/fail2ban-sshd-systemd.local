@@ -1,0 +1,12 @@
+# moodle-server-care / hygiene H7 — sshd jail reads the systemd journal.
+# Why: journald-only systems (Debian 12 without rsyslog) have no /var/log/auth.log; the packaged sshd jail then
+# fails with "Have not found any log file for sshd jail" and fail2ban stays dead. Needs python3-systemd.
+# Install as /etc/fail2ban/jail.d/zz-sshd-systemd.local (zz- loads after defaults-debian.conf; .local overrides .conf).
+# backend is set inside [sshd] because jail.conf's [sshd] has its own backend = %(sshd_backend)s.
+[sshd]
+enabled = true
+backend = systemd
+# Admin static addresses that must never be banned (space-separated), filled in with the owner:
+# ignoreip = 127.0.0.1/8 ::1 <ADMIN_IP>
+# OpenSSH >= 9.8 logs from sshd-session; uncomment if "Total failed" stays 0 while the journal shows failures:
+# journalmatch = _SYSTEMD_UNIT=ssh.service + _COMM=sshd-session

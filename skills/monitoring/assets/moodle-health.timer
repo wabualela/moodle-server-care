@@ -1,0 +1,11 @@
+# Pair with a healthchecks.io check: period 1 minute, grace 3 minutes or more (installed by the monitoring module).
+[Unit]
+Description=Run the Moodle server health check every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

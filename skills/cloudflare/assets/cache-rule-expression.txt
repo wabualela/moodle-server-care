@@ -1,0 +1,9 @@
+# Cloudflare Cache Rule "Moodle static" - paste the expression below (without these comment lines) into
+# Caching > Cache Rules > Create rule > Custom filter expression > Edit expression.
+# Settings: Eligible for cache; Edge TTL "Use cache-control header if present, bypass cache if not";
+#           Browser TTL "Respect origin TTL"; keep the default cache key (query string included).
+# If $CFG->wwwroot has a sub-path (https://example.com/moodle), put it in front of every path: "/moodle/theme/...".
+# Optional lines (add only after the header checks in references/cache-rules.md):
+#   or starts_with(http.request.uri.path, "/r.php/core/esm/")
+#   or starts_with(http.request.uri.path, "/pluginfile.php/1/local_edwiserpagebuilder/")
+(starts_with(http.request.uri.path, "/theme/styles.php/") or starts_with(http.request.uri.path, "/theme/javascript.php/") or starts_with(http.request.uri.path, "/theme/jquery.php/") or starts_with(http.request.uri.path, "/theme/image.php/") or starts_with(http.request.uri.path, "/theme/font.php/") or starts_with(http.request.uri.path, "/lib/javascript.php/") or starts_with(http.request.uri.path, "/lib/requirejs.php/") or http.request.uri.path eq "/theme/yui_combo.php")

@@ -1,0 +1,11 @@
+# Drop-in for apt-daily-upgrade.timer (moodle-server-care, skills/maintenance; references/unattended-upgrades.md).
+# Target: /etc/systemd/system/apt-daily-upgrade.timer.d/override.conf (what `systemctl edit apt-daily-upgrade.timer` writes).
+# Why: unattended-upgrades restarts services it upgrades (the DB server, nginx, Redis, PHP-FPM if its origin is
+# allowed). The distribution default (06:00 + up to 60 min on Debian) is often a busy hour. Move it into the measured
+# quiet window, AFTER the nightly backup's hard stop, so an upgrade never restarts the DB under a running dump.
+# OnCalendar is server local time. The empty OnCalendar= line clears the packaged schedule first.
+# Rollback: systemctl revert apt-daily-upgrade.timer && systemctl daemon-reload
+[Timer]
+OnCalendar=
+OnCalendar=*-*-* @APT_AT@
+RandomizedDelaySec=@APT_DELAY@

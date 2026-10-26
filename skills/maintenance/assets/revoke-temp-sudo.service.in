@@ -1,0 +1,7 @@
+# /etc/systemd/system/revoke-@USER@-nopasswd-sudo.service (moodle-server-care, references/temporary-sudo.md)
+[Unit]
+Description=Remove the temporary passwordless sudo rule of @USER@
+
+[Service]
+Type=oneshot
+ExecStart=/bin/rm -f /etc/sudoers.d/90-@USER@-nopasswd

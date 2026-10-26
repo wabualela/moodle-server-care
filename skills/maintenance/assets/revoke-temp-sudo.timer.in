@@ -1,0 +1,14 @@
+# /etc/systemd/system/revoke-@USER@-nopasswd-sudo.timer (moodle-server-care, references/temporary-sudo.md)
+# A FIXED date (OnCalendar) with Persistent=true: it fires at @UNTIL@, or at the next boot if the server was down then.
+# Never use a transient `systemd-run --on-active=` timer for this: it vanishes on reboot (leaving the rule forever) and
+# is re-armed by every daemon-reload (the expiry drifts).
+[Unit]
+Description=Expire the temporary passwordless sudo rule of @USER@ at @UNTIL@
+
+[Timer]
+OnCalendar=@UNTIL@
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

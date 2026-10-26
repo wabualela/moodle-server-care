@@ -1,0 +1,50 @@
+# Rendered by moodle-server-care skills/backup/scripts/render-install.sh. Target: /etc/systemd/system/@NAME@.service
+[Unit]
+Description=Nightly encrypted off-provider backup of @SITE@ (@BACKEND_LABEL@)
+Documentation=file:/usr/local/share/@NAME@/README.md
+# If an unattended-upgrades run is still active (it can restart the DB server), wait for it instead of dumping during
+# it. The timer and TimeoutStartSec below are chosen so this run ends before the upgrade window opens.
+After=network-online.target @DB_UNIT@ apt-daily-upgrade.service
+Wants=network-online.target
+OnFailure=@NAME@-alert.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/@NAME@
+# Low priority next to PHP-FPM and the DB. (No IOScheduling*/IOWeight: with mq-deadline or none they have no effect,
+# and the heavy dump I/O happens inside the DB server, outside this cgroup anyway.)
+Nice=10
+CPUWeight=20
+MemoryHigh=2G
+MemoryMax=3G
+# Hard stop: the timer fires @AT@ + up to 5 min (AccuracySec=1s), so @TIMEOUT_MIN@ min ends the run by @HARD_STOP@ +
+# 5 min at the latest, before the upgrade window (@APT_AT@). The script starts no step after @HARD_STOP@, no weekly or
+# monthly copy with less than 15 min left, and gives each filedir step a --max-duration. The first full upload (seed)
+# is NOT done by this unit: references/install.md step 4.
+TimeoutStartSec=@TIMEOUT_MIN@min
+# Sandbox: the whole file system read-only except the directories below. /var/lib/@NAME@ holds the rclone config,
+# which rclone REWRITES when Microsoft rolls the refresh token (temp file + rename in that directory), so it must stay
+# writable here and must never live under /root or /home (ProtectHome).
+# MTA spool (exim: /var/spool/exim4 + /var/log/exim4; Postfix: /var/spool/postfix; "-" = ignored when absent): the
+# optional "completed with warnings" mail is sent from inside this unit (failure mails come from the unsandboxed
+# alert unit), and the MTA must write its spool or the send fails. Without MAIL_TO these lines change nothing.
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+StateDirectory=@NAME@
+StateDirectoryMode=0755
+ReadWritePaths=-/var/backups/@NAME@ -/var/spool/exim4 -/var/log/exim4 -/var/spool/postfix
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+UMask=0077
+# Not set on purpose: CapabilityBoundingSet / PrivateDevices (root must read every file of the bundle, setpriv drops
+# to the .git owner for git). Add them later only after a dry run under them (install step 5 uses this exact sandbox).
